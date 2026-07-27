@@ -82,27 +82,45 @@ impl Scratch {
         let cnd = g.dataset("pixels/count")?;
         let (mut b2_blob, mut cn_blob) = (Vec::new(), Vec::new());
         let (mut b2_off, mut cn_off) = (vec![0i64], vec![0i64]);
-        let mut max_chunk_pix = 1usize;
-        for c in 0..nchunks {
-            let (r0, r1) = (chunk_row[c] as usize, chunk_row[c + 1] as usize);
-            let (p0, p1) = (rowptr[r0], rowptr[r1]);
-            let npix = (p1 - p0) as usize;
-            if npix == 0 { b2_off.push(*b2_off.last().unwrap()); cn_off.push(*cn_off.last().unwrap()); continue; }
-            max_chunk_pix = max_chunk_pix.max(npix);
-            let b2 = b2d.read_slice_1d::<i64, _>(p0 as usize..p1 as usize)?;
-            let cn = cnd.read_slice_1d::<i32, _>(p0 as usize..p1 as usize)?;
-            // within-row delta of bin2 (first-of-row = bin2 - rowindex), u32
-            let mut d = vec![0u32; npix];
-            for r in r0..r1 {
-                let (s, e) = ((rowptr[r] - p0) as usize, (rowptr[r + 1] - p0) as usize);
-                if s >= e { continue; }
-                let mut prev = r as i64;
-                for j in s..e { d[j] = (b2[j] - prev) as u32; prev = b2[j]; }
+        let max_chunk_pix = (0..nchunks).map(|c| (rowptr[chunk_row[c + 1] as usize] - rowptr[chunk_row[c] as usize]) as usize).max().unwrap_or(1).max(1);
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(nthreads).build().unwrap();
+        let read_block = 50_000_000usize; // pixels per HDF5 read batch
+        let mut c = 0usize;
+        while c < nchunks {
+            // gather a batch of whole chunks (~read_block pixels), read once, encode in parallel
+            let cstart = c;
+            let mut pix = 0i64;
+            while c < nchunks && (pix as usize) < read_block { pix += rowptr[chunk_row[c + 1] as usize] - rowptr[chunk_row[c] as usize]; c += 1; }
+            let cend = c;
+            let (bp0, bp1) = (rowptr[chunk_row[cstart] as usize], rowptr[chunk_row[cend] as usize]);
+            if bp1 <= bp0 { for _ in cstart..cend { b2_off.push(*b2_off.last().unwrap()); cn_off.push(*cn_off.last().unwrap()); } continue; }
+            let b2blk = b2d.read_slice_1d::<i64, _>(bp0 as usize..bp1 as usize)?;
+            let cnblk = cnd.read_slice_1d::<i32, _>(bp0 as usize..bp1 as usize)?;
+            let (b2s, cns) = (b2blk.as_slice().unwrap(), cnblk.as_slice().unwrap());
+            let rp = &rowptr;
+            let cr = &chunk_row;
+            let encoded: Vec<(Vec<u8>, Vec<u8>)> = pool.install(|| {
+                (cstart..cend).into_par_iter().map(|cc| {
+                    let (r0, r1) = (cr[cc] as usize, cr[cc + 1] as usize);
+                    let (p0, p1) = (rp[r0], rp[r1]);
+                    let npix = (p1 - p0) as usize;
+                    if npix == 0 { return (Vec::new(), Vec::new()); }
+                    let off = bp0;
+                    let mut d = vec![0u32; npix];
+                    for r in r0..r1 {
+                        let (s, e) = ((rp[r] - p0) as usize, (rp[r + 1] - p0) as usize);
+                        if s >= e { continue; }
+                        let mut prev = r as i64;
+                        for j in s..e { let bv = b2s[(p0 - off) as usize + j]; d[j] = (bv - prev) as u32; prev = bv; }
+                    }
+                    let cslice = &cns[(p0 - off) as usize..(p1 - off) as usize];
+                    (compress(&shuffle4(&d)), enc_count(cslice))
+                }).collect()
+            });
+            for (b2c, cnc) in encoded {
+                b2_blob.extend_from_slice(&b2c); b2_off.push(b2_off.last().unwrap() + b2c.len() as i64);
+                cn_blob.extend_from_slice(&cnc); cn_off.push(cn_off.last().unwrap() + cnc.len() as i64);
             }
-            let comp = compress(&shuffle4(&d));
-            b2_blob.extend_from_slice(&comp); b2_off.push(b2_off.last().unwrap() + comp.len() as i64);
-            let cc = enc_count(cn.as_slice().unwrap());
-            cn_blob.extend_from_slice(&cc); cn_off.push(cn_off.last().unwrap() + cc.len() as i64);
         }
         Ok(Scratch { nbins, nnz, chrom_offset, rowptr, chunk_row, b2_blob, b2_off, cn_blob, cn_off, max_chunk_pix, nthreads })
     }
