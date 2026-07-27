@@ -41,3 +41,15 @@ cload phase-A spills sorted key runs as delta + byte-shuffle(8) + LZ4 blocks (1M
 Measured ~1.76 B/key vs 8.0 raw = 4.5x less spill IO. Validated exact. Makes the ~300B-pair @64bp
 run disk-feasible (2.4 TB raw spill -> ~529 GB compressed). Parse throughput unchanged (84 Mpairs/s;
 compress overlaps spill). Phase-B RunReader decompresses blocks (1M keys/reader in flight -> bounded).
+
+## Tiled (cache-blocked) SpMV — result (256bp monster: 2.56B pix, 12.5M bins)
+Uniform 2D tiling (block B), tile (I,J) block-local bin1/bin2, cache-blocked SpMV. Bit-IDENTICAL to
+row-chunk (2.55e-16) and cooler. Speed (B=65536, --threads 8):
+  row-chunk: build 17s, mask 38s, IC 21s/iter, total 201s
+  tiled:     build 42s, mask 25s, IC 14.6s/iter, total 169s
+=> ~1.4x SpMV, 1.5x marginals, 1.2x overall. LESS than the coolerx C prototype's 2.5x, because
+(a) the extra per-pixel bin1-local decode stream adds decode cost offsetting the cache gain,
+(b) tiled BUILD is slower (counting-sort + 2 shuffle-encodes/tile: 42 vs 17s).
+LEVERS to close the gap: (1) store bin1 as per-tile CSR (rowptr) instead of per-pixel u32 stream ->
+removes a whole decode stream; (2) B sweep (32k/65k/131k); (3) persistent rayon pool (currently a new
+ThreadPool per spmv/marginals call). CLI: `rooler balance ... --block 65536`. Row-chunk is still default.

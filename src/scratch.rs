@@ -5,7 +5,7 @@ use anyhow::Result;
 use lz4_flex::block::{compress, decompress};
 use rayon::prelude::*;
 
-fn shuffle4(src: &[u32]) -> Vec<u8> {
+pub(crate) fn shuffle4(src: &[u32]) -> Vec<u8> {
     let n = src.len();
     let mut o = vec![0u8; 4 * n];
     for i in 0..n {
@@ -14,13 +14,13 @@ fn shuffle4(src: &[u32]) -> Vec<u8> {
     }
     o
 }
-fn unshuffle4(buf: &[u8], n: usize, out: &mut [u32]) {
+pub(crate) fn unshuffle4(buf: &[u8], n: usize, out: &mut [u32]) {
     for i in 0..n {
         out[i] = u32::from_le_bytes([buf[i], buf[n + i], buf[2 * n + i], buf[3 * n + i]]);
     }
 }
 // count codec: [u32 nexc][u32 idx*nexc][u32 val*nexc][lz4(u8 base)]  (base_len = npix known by caller)
-fn enc_count(cn: &[i32]) -> Vec<u8> {
+pub(crate) fn enc_count(cn: &[i32]) -> Vec<u8> {
     let n = cn.len();
     let mut idx = Vec::new(); let mut val = Vec::new();
     let mut base = vec![0u8; n];
@@ -36,7 +36,7 @@ fn enc_count(cn: &[i32]) -> Vec<u8> {
     out.extend_from_slice(&comp);
     out
 }
-fn dec_count(buf: &[u8], npix: usize, out: &mut [i32]) {
+pub(crate) fn dec_count(buf: &[u8], npix: usize, out: &mut [i32]) {
     let nexc = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
     let mut p = 4;
     let idx_end = p + 4 * nexc; let val_end = idx_end + 4 * nexc;
@@ -210,4 +210,22 @@ impl Scratch {
                     |mut a, b| { for i in 0..nbins { a.0[i] += b.0[i]; a.1[i] += b.1[i]; } a })
         })
     }
+}
+
+/// Common interface so balance can run over either the row-chunk or the tiled scratch.
+pub trait SpMV: Sync {
+    fn nbins(&self) -> usize;
+    fn nnz(&self) -> usize;
+    fn chrom_offset(&self) -> &[i64];
+    fn comp_bytes(&self) -> usize;
+    fn marginals(&self, ndiag: i64) -> (Vec<f64>, Vec<f64>);
+    fn spmv(&self, v: &[f64], ndiag: i64) -> Vec<f64>;
+}
+impl SpMV for Scratch {
+    fn nbins(&self) -> usize { self.nbins }
+    fn nnz(&self) -> usize { self.nnz }
+    fn chrom_offset(&self) -> &[i64] { &self.chrom_offset }
+    fn comp_bytes(&self) -> usize { Scratch::comp_bytes(self) }
+    fn marginals(&self, ndiag: i64) -> (Vec<f64>, Vec<f64>) { Scratch::marginals(self, ndiag) }
+    fn spmv(&self, v: &[f64], ndiag: i64) -> Vec<f64> { Scratch::spmv(self, v, ndiag) }
 }

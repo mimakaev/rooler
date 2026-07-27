@@ -4,6 +4,7 @@ mod cload;
 mod zoomify;
 mod balance;
 mod scratch;
+mod scratch_tiled;
 mod expected;
 #[allow(dead_code)]
 mod view;
@@ -54,6 +55,7 @@ enum Cmd {
         #[arg(long, default_value="1e-4")] tol: f64,
         #[arg(long, default_value="200")] max_iters: usize,
         #[arg(long, default_value="8")] threads: usize,
+        #[arg(long)] block: Option<i64>,
     },
     /// Compute + store cis expected P(s) per region (arms/chroms)
     Expected {
@@ -79,8 +81,8 @@ fn main() -> Result<()> {
         Cmd::Zoomify { src, out, resolutions, preset, assembly } => {
             zoomify::zoomify(&src, &out, resolutions, cooler::Comp::parse(&preset), assembly.as_deref(), true)?;
         }
-        Cmd::Balance { uri, ignore_diags, mad_max, min_nnz, min_count, tol, max_iters, threads } => {
-            balance::balance(&uri, balance::Params{ignore_diags, mad_max, min_nnz, min_count, tol, max_iters, nthreads: threads}, true)?;
+        Cmd::Balance { uri, ignore_diags, mad_max, min_nnz, min_count, tol, max_iters, threads, block } => {
+            balance::balance(&uri, balance::Params{ignore_diags, mad_max, min_nnz, min_count, tol, max_iters, nthreads: threads, tiled_block: block}, true)?;
         }
         Cmd::Expected { uri, view } => {
             expected::expected(&uri, view.as_deref(), true)?;
