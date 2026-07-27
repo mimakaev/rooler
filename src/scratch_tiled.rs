@@ -32,7 +32,8 @@ impl TiledScratch {
         let mut rowptr: Vec<i64> = g.dataset("indexes/bin1_offset")?.read_1d::<i64>()?.to_vec();
         if rowptr.len() == nbins { rowptr.push(nnz as i64); }
         let chrom_offset: Vec<i64> = g.dataset("indexes/chrom_offset")?.read_1d::<i64>()?.to_vec();
-        let nblocks = ((nbins as i64 + block - 1) / block) as usize;
+        let bsz = block as usize;
+        let nblocks = (nbins + bsz - 1) / bsz;
         let b2d = g.dataset("pixels/bin2_id")?;
         let cnd = g.dataset("pixels/count")?;
         let pool = rayon::ThreadPoolBuilder::new().num_threads(nthreads).build().unwrap();
@@ -42,57 +43,80 @@ impl TiledScratch {
         let (mut b1_off, mut b2_off, mut cn_off) = (vec![0i64], vec![0i64], vec![0i64]);
         let mut max_tile = 1usize;
 
-        for ib in 0..nblocks {
-            let r0 = ib * (block as usize);
-            let r1 = ((ib + 1) * block as usize).min(nbins);
-            let (p0, p1) = (rowptr[r0], rowptr[r1]);
-            let npix = (p1 - p0) as usize;
-            if npix == 0 { continue; }
-            let bin2 = b2d.read_slice_1d::<i64, _>(p0 as usize..p1 as usize)?;
-            let cn = cnd.read_slice_1d::<i32, _>(p0 as usize..p1 as usize)?;
+        // Batched-read + parallel-band build (mirrors the row-chunk scratch): read a batch of
+        // consecutive I-blocks once on this thread (HDF5 Dataset handle never shared across threads),
+        // then do ALL per-band CPU work (local coords, counting-sort, scatter, encode) in parallel.
+        let band_pix = |ib: usize| -> i64 {
+            let r1 = ((ib + 1) * bsz).min(nbins);
+            rowptr[r1] - rowptr[ib * bsz]
+        };
+        let read_block = 50_000_000i64; // pixels per HDF5 read batch
+        let mut ib = 0usize;
+        while ib < nblocks {
+            let bstart = ib;
+            let mut pix = 0i64;
+            while ib < nblocks && pix < read_block { pix += band_pix(ib); ib += 1; }
+            let bend = ib;
+            let (gp0, gp1) = (rowptr[bstart * bsz], rowptr[(bend * bsz).min(nbins)]);
+            if gp1 <= gp0 { continue; }
+            let bin2 = b2d.read_slice_1d::<i64, _>(gp0 as usize..gp1 as usize)?;
+            let cn = cnd.read_slice_1d::<i32, _>(gp0 as usize..gp1 as usize)?;
             let (bin2, cn) = (bin2.as_slice().unwrap(), cn.as_slice().unwrap());
-            // per-pixel bin1-local, J block, bin2-local
-            let mut b1l = vec![0u32; npix];
-            let mut jj = vec![0u32; npix];
-            let mut b2l = vec![0u32; npix];
-            {
-                let mut idx = 0usize;
-                for r in r0..r1 {
-                    let c = (rowptr[r + 1] - rowptr[r]) as usize;
-                    let rl = (r - r0) as u32;
-                    for _ in 0..c {
-                        let bv = bin2[idx];
-                        let j = (bv / block) as u32;
-                        b1l[idx] = rl; jj[idx] = j; b2l[idx] = (bv - (j as i64) * block) as u32;
-                        idx += 1;
+            let rp = &rowptr;
+            // process each whole band in the batch in parallel; result[k] holds band bstart+k's tiles
+            let bands: Vec<Vec<(usize, usize, Vec<u8>, Vec<u8>, Vec<u8>)>> = pool.install(|| {
+                (bstart..bend).into_par_iter().map(|ibb| {
+                    let r0 = ibb * bsz;
+                    let r1 = ((ibb + 1) * bsz).min(nbins);
+                    let (p0, p1) = (rp[r0], rp[r1]);
+                    let npix = (p1 - p0) as usize;
+                    if npix == 0 { return Vec::new(); }
+                    let base = (p0 - gp0) as usize; // offset into this batch's read buffers
+                    // per-pixel bin1-local, J block, bin2-local
+                    let mut b1l = vec![0u32; npix];
+                    let mut jj = vec![0u32; npix];
+                    let mut b2l = vec![0u32; npix];
+                    let mut idx = 0usize;
+                    for r in r0..r1 {
+                        let c = (rp[r + 1] - rp[r]) as usize;
+                        let rl = (r - r0) as u32;
+                        for _ in 0..c {
+                            let bv = bin2[base + idx];
+                            let j = (bv / block) as u32;
+                            b1l[idx] = rl; jj[idx] = j; b2l[idx] = (bv - (j as i64) * block) as u32;
+                            idx += 1;
+                        }
                     }
-                }
-            }
-            // counting-sort by J (J in [ib, nblocks)) -> contiguous per-tile buckets
-            let mut jcount = vec![0usize; nblocks + 1];
-            for &j in &jj { jcount[j as usize] += 1; }
-            let mut joff = vec![0usize; nblocks + 1];
-            { let mut a = 0usize; for j in 0..=nblocks { joff[j] = a; a += jcount[j]; } }
-            let (mut rb1, mut rb2, mut rcn) = (vec![0u32; npix], vec![0u32; npix], vec![0i32; npix]);
-            let mut pos = joff.clone();
-            for p in 0..npix {
-                let j = jj[p] as usize;
-                let d = pos[j]; rb1[d] = b1l[p]; rb2[d] = b2l[p]; rcn[d] = cn[p]; pos[j] += 1;
-            }
-            // encode non-empty tiles (I, j) in parallel
-            let jlist: Vec<usize> = (ib..nblocks).filter(|&j| jcount[j] > 0).collect();
-            let tiles: Vec<(usize, usize, Vec<u8>, Vec<u8>, Vec<u8>)> = pool.install(|| {
-                jlist.par_iter().map(|&j| {
-                    let (s, e) = (joff[j], joff[j] + jcount[j]);
-                    (j, e - s, compress(&shuffle4(&rb1[s..e])), compress(&shuffle4(&rb2[s..e])), enc_count(&rcn[s..e]))
+                    // counting-sort by J (J in [ibb, nblocks)) -> contiguous per-tile buckets
+                    let mut jcount = vec![0usize; nblocks + 1];
+                    for &j in &jj { jcount[j as usize] += 1; }
+                    let mut joff = vec![0usize; nblocks + 1];
+                    { let mut a = 0usize; for j in 0..=nblocks { joff[j] = a; a += jcount[j]; } }
+                    let (mut rb1, mut rb2, mut rcn) = (vec![0u32; npix], vec![0u32; npix], vec![0i32; npix]);
+                    let mut pos = joff.clone();
+                    for p in 0..npix {
+                        let j = jj[p] as usize;
+                        let d = pos[j]; rb1[d] = b1l[p]; rb2[d] = b2l[p]; rcn[d] = cn[base + p]; pos[j] += 1;
+                    }
+                    // encode non-empty tiles (bands already run in parallel -> encode serially here)
+                    let mut out = Vec::new();
+                    for j in ibb..nblocks {
+                        if jcount[j] == 0 { continue; }
+                        let (s, e) = (joff[j], joff[j] + jcount[j]);
+                        out.push((j, e - s, compress(&shuffle4(&rb1[s..e])), compress(&shuffle4(&rb2[s..e])), enc_count(&rcn[s..e])));
+                    }
+                    out
                 }).collect()
             });
-            for (j, np, b1c, b2c, cnc) in tiles {
-                tile_i.push(ib as i32); tile_j.push(j as i32); tile_np.push(np as i64);
-                max_tile = max_tile.max(np);
-                b1_blob.extend_from_slice(&b1c); b1_off.push(b1_off.last().unwrap() + b1c.len() as i64);
-                b2_blob.extend_from_slice(&b2c); b2_off.push(b2_off.last().unwrap() + b2c.len() as i64);
-                cn_blob.extend_from_slice(&cnc); cn_off.push(cn_off.last().unwrap() + cnc.len() as i64);
+            for (k, band) in bands.into_iter().enumerate() {
+                let ibb = bstart + k;
+                for (j, np, b1c, b2c, cnc) in band {
+                    tile_i.push(ibb as i32); tile_j.push(j as i32); tile_np.push(np as i64);
+                    max_tile = max_tile.max(np);
+                    b1_blob.extend_from_slice(&b1c); b1_off.push(b1_off.last().unwrap() + b1c.len() as i64);
+                    b2_blob.extend_from_slice(&b2c); b2_off.push(b2_off.last().unwrap() + b2c.len() as i64);
+                    cn_blob.extend_from_slice(&cnc); cn_off.push(cn_off.last().unwrap() + cnc.len() as i64);
+                }
             }
         }
         Ok(TiledScratch {
