@@ -63,4 +63,4 @@ compressed scratch (~2 B/pixel) to the data (no `--mem`). See `MEMORY_CALIBRATIO
 
 ## Status
 Working: cload, merge, zoomify, balance, expected, read API, assembly enforcement. See `PROGRESS.md`.
-Roadmap: ranged-parallel merge; compressed spill runs; noodles-bgzf; more arm tables; KR (deprioritized).
+Roadmap: compressed spill (DONE, 4.5x less IO); noodles-bgzf; more arm tables; KR (deprioritized).

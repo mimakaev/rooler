@@ -35,3 +35,9 @@ incl. distiller's ~5 parallel merges (5 x ~5 GB = 25 GB < 32).
   the 26B-pixel output) + hdf5 crate serializes reads via a global lock. Ranged-parallel helps read+merge, not
   the serial write. REAL LEVER: parallelize the WRITE (set BLOSC_NTHREADS / blosc filter nthreads, or a
   multi-threaded writer). ~125% CPU observed confirms write/read-lock bound, not merge-compute bound.
+
+## Compressed spill (cload) — done
+cload phase-A spills sorted key runs as delta + byte-shuffle(8) + LZ4 blocks (1M keys/block).
+Measured ~1.76 B/key vs 8.0 raw = 4.5x less spill IO. Validated exact. Makes the ~300B-pair @64bp
+run disk-feasible (2.4 TB raw spill -> ~529 GB compressed). Parse throughput unchanged (84 Mpairs/s;
+compress overlaps spill). Phase-B RunReader decompresses blocks (1M keys/reader in flight -> bounded).

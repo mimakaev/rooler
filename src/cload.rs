@@ -6,11 +6,23 @@ use crate::cooler::{CoolWriter, Comp};
 use crate::merge::{merge_sources_parallel, BlockSource};
 use anyhow::{anyhow, Result};
 use crossbeam_channel::{bounded, Receiver};
+use lz4_flex::block::{compress, decompress};
 use memchr::{memchr, memrchr};
 use std::collections::HashMap;
 use std::io::{Read, Write, BufWriter, BufReader};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+
+const SPILL_BLK: usize = 1_000_000; // keys per compressed spill block
+
+fn shuffle8(d: &[i64]) -> Vec<u8> {
+    let n = d.len(); let mut o = vec![0u8; 8 * n];
+    for i in 0..n { let b = d[i].to_le_bytes(); for p in 0..8 { o[p * n + i] = b[p]; } }
+    o
+}
+fn unshuffle8(buf: &[u8], n: usize) -> Vec<i64> {
+    (0..n).map(|i| { let mut b = [0u8; 8]; for p in 0..8 { b[p] = buf[p * n + i]; } i64::from_le_bytes(b) }).collect()
+}
 
 struct Bins { cmap: HashMap<Vec<u8>, i64>, off_lo: Vec<i64>, nbins: i64, binsize: i64 }
 
@@ -25,14 +37,23 @@ fn worker(rx: Receiver<Vec<u8>>, bins: Arc<Bins>, cap: usize, tmpdir: Arc<String
     let mut seq = 0usize;
     let (mut lc1, mut li1, mut lc2, mut li2): (Vec<u8>, i64, Vec<u8>, i64) = (Vec::new(), -1, Vec::new(), -1);
     let nb = bins.nbins;
+    // compressed sorted-key runs: per block, delta + byte-shuffle + LZ4 (less spill IO)
     let spill = |buf: &mut Vec<i64>, seq: &mut usize, paths: &mut Vec<String>| -> Result<()> {
         if buf.is_empty() { return Ok(()); }
         buf.sort_unstable();
-        let p = format!("{}/r{}_{}.i64", tmpdir, wid, seq);
+        let p = format!("{}/r{}_{}.kz", tmpdir, wid, seq);
         let mut w = BufWriter::new(std::fs::File::create(&p)?);
-        let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len() * 8) };
-        w.write_all(bytes)?; w.flush()?;
-        paths.push(p); *seq += 1; buf.clear();
+        for chunk in buf.chunks(SPILL_BLK) {
+            let n = chunk.len();
+            let mut d = vec![0i64; n];
+            d[0] = chunk[0];
+            for i in 1..n { d[i] = chunk[i] - chunk[i - 1]; }
+            let comp = compress(&shuffle8(&d));
+            w.write_all(&(n as u32).to_le_bytes())?;
+            w.write_all(&(comp.len() as u32).to_le_bytes())?;
+            w.write_all(&comp)?;
+        }
+        w.flush()?; paths.push(p); *seq += 1; buf.clear();
         Ok(())
     };
     for block in rx.iter() {
@@ -165,49 +186,25 @@ pub fn cload(pairs: &str, binsize: i64, out: &str, mem_gb: f64, nthreads: usize,
 }
 
 /// Reads i64 keys from a spilled run in blocks; yields (keys, counts=1).
-pub struct RunReader { f: BufReader<std::fs::File>, block: usize }
+pub struct RunReader { f: BufReader<std::fs::File> }
 impl RunReader {
-    pub fn open(p: &str, block: usize) -> Result<RunReader> {
-        Ok(RunReader { f: BufReader::new(std::fs::File::open(p)?), block })
-    }
-    /// clone-open the same file with an independent cursor over a byte range (for ranged merge)
-    pub fn open_range(p: &str, byte_lo: u64, byte_hi: u64, block: usize) -> Result<RangeRun> {
-        RangeRun::open(p, byte_lo, byte_hi, block)
+    pub fn open(p: &str, _block: usize) -> Result<RunReader> {
+        Ok(RunReader { f: BufReader::new(std::fs::File::open(p)?) })
     }
 }
 impl BlockSource for RunReader {
     fn next(&mut self) -> Result<Option<(Vec<i64>, Vec<i64>)>> {
-        let mut bytes = vec![0u8; self.block * 8];
-        let mut filled = 0;
-        while filled < bytes.len() { let n = self.f.read(&mut bytes[filled..])?; if n == 0 { break; } filled += n; }
-        if filled == 0 { return Ok(None); }
-        let m = filled / 8;
-        let keys: Vec<i64> = (0..m).map(|i| i64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap())).collect();
-        Ok(Some((keys, vec![1i64; m])))
-    }
-}
-
-/// A run reader confined to [byte_lo, byte_hi) (8-byte aligned) for ranged-parallel merge.
-pub struct RangeRun { f: std::fs::File, pos: u64, end: u64, block: usize }
-impl RangeRun {
-    fn open(p: &str, byte_lo: u64, byte_hi: u64, block: usize) -> Result<RangeRun> {
-        use std::io::Seek;
-        let mut f = std::fs::File::open(p)?;
-        f.seek(std::io::SeekFrom::Start(byte_lo))?;
-        Ok(RangeRun { f, pos: byte_lo, end: byte_hi, block })
-    }
-}
-impl BlockSource for RangeRun {
-    fn next(&mut self) -> Result<Option<(Vec<i64>, Vec<i64>)>> {
-        if self.pos >= self.end { return Ok(None); }
-        let want = std::cmp::min((self.block * 8) as u64, self.end - self.pos) as usize;
-        let mut bytes = vec![0u8; want];
-        let mut filled = 0;
-        while filled < want { let n = self.f.read(&mut bytes[filled..])?; if n == 0 { break; } filled += n; }
-        if filled == 0 { return Ok(None); }
-        self.pos += filled as u64;
-        let m = filled / 8;
-        let keys: Vec<i64> = (0..m).map(|i| i64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().unwrap())).collect();
-        Ok(Some((keys, vec![1i64; m])))
+        let mut hdr = [0u8; 8];
+        if self.f.read_exact(&mut hdr).is_err() { return Ok(None); } // EOF
+        let n = u32::from_le_bytes(hdr[0..4].try_into().unwrap()) as usize;
+        let clen = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as usize;
+        let mut cbuf = vec![0u8; clen];
+        self.f.read_exact(&mut cbuf)?;
+        let raw = decompress(&cbuf, 8 * n).map_err(|e| anyhow!("spill decompress: {}", e))?;
+        let d = unshuffle8(&raw, n);
+        let mut keys = vec![0i64; n];
+        let mut acc = 0i64;
+        for i in 0..n { acc += d[i]; keys[i] = acc; }
+        Ok(Some((keys, vec![1i64; n])))
     }
 }
