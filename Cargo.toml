@@ -1,0 +1,23 @@
+[package]
+name = "rooler"
+version = "0.1.0"
+edition = "2021"
+description = "Fast out-of-core cooler engine: cload / merge / balance"
+
+[dependencies]
+hdf5 = { package = "hdf5-metno", version = "0.9", features = ["blosc"] }
+ndarray = "0.16"
+lz4_flex = "0.11"
+blosc-src = { version = "0.3.8", features = ["lz4", "zstd"] }
+rayon = "1"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+crossbeam-channel = "0.5"
+memchr = "2"
+rustfft = "6"
+num-complex = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

@@ -1,0 +1,27 @@
+# rooler memory calibration (measured 2026-07-27)
+Peak RSS by op (VmHWM), from real runs:
+
+| op | data | --mem | peak RSS | model |
+|---|---|---|---|---|
+| cload | 2.61B pairs @256bp | 8 | 16.0 GB* | ~2x --mem (phaseA buffers + phaseB blocks, glibc retains) |
+| merge | 2 coolers @262kb | 2 | 3.0 GB | --mem + ~1 GB (K readers + emit + O(nbins)) |
+| balance | 1.12B pix, 64K bins | (auto) | 1.24 GB | compressed scratch (~1-2.6 B/pix * nnz) + ~O(nbins) vectors |
+| zoomify | 62M pix | (auto) | 0.23 GB | streaming + coarsen map (fine_nbins i64) |
+| expected | 1.12B pix | (auto) | 0.11 GB | per-region sum arrays (~nbins) + FFT buffers |
+*cload phase-B block now capped -> RSS ~= --mem + ~1-2 GB after fix.
+
+## Rules of thumb
+- cload/merge peak RSS ~= --mem + O(nbins)-ish overhead (post phase-B cap). Set --mem = RAM_budget * ~0.5.
+- balance peak RSS ~= compressed_scratch = ~2 B/pixel * nnz  (megacooler 26B pix -> ~55 GB, fits 64 GB).
+  NO --mem for balance (scratch sizes to data); balance a huge cooler needs RAM >= ~2 B/pix * nnz.
+- zoomify/expected: small, O(nbins). Safe anywhere.
+
+## cooler --chunksize/--nproc -> --mem shim (for distiller drop-in)
+cooler holds ~chunksize pixel-rows per proc as pandas frames (~40 B/row). So:
+    rooler --mem_GB  ~=  chunksize * nproc * 40e-9      (matches cooler's footprint)
+e.g. cooler --chunksize 10_000_000 --nproc 8  ->  --mem ~= 3.2 GB.
+(Constant ~40 B/row is approximate; recalibrate against a cooler run if exactness needed.)
+
+## Defaults set
+cload/merge --mem default = 4 GB (RSS ~5-6 GB). balance --threads 8. All safe on a 32/64 GB box,
+incl. distiller's ~5 parallel merges (5 x ~5 GB = 25 GB < 32).
