@@ -87,6 +87,75 @@ pub fn merge_sources_parallel<S: BlockSource>(
     })
 }
 
+/// Ranged-parallel merge: partition bin1 into P count-balanced ranges (sliced from each input via
+/// bin1_offset), merge each range on its own thread, and stream range outputs to the writer IN ORDER
+/// via bounded channels (backpressure bounds RAM; no temp files). Falls back to serial for P<=1.
+pub fn merge_coolers_parallel(
+    paths: &[String], res: Option<&str>, out: &str, mem_gb: f64, nthreads: usize, comp: Comp,
+    assembly: Option<&str>, log: bool,
+) -> Result<u64> {
+    use std::sync::Arc;
+    if nthreads <= 1 { return merge_coolers(paths, res, out, mem_gb, comp, assembly, log); }
+    let t0 = std::time::Instant::now();
+    let meta = read_meta(&paths[0], res)?;
+    let nbins = meta.nbins as i64;
+    let chromsizes: Vec<(String, i64)> = meta.names.iter().cloned().zip(meta.lengths.iter().cloned()).collect();
+    let asm = match assembly {
+        Some(a) if !a.trim().is_empty() => a.trim().to_string(),
+        _ if !meta.assembly.is_empty() && meta.assembly != "unknown" => meta.assembly.clone(),
+        _ => crate::view::detect("", &chromsizes).map(|s| s.to_string()).ok_or_else(|| anyhow::anyhow!(
+            "refusing to merge without a genome assembly; pass --assembly"))?,
+    };
+    let offs: Vec<Vec<i64>> = paths.iter().map(|p| CoolerPix::bin1_offset(p, res)).collect::<Result<_>>()?;
+    // count-balanced bin1 partition into P ranges
+    let mut per = vec![0i64; meta.nbins];
+    for o in &offs { for b in 0..meta.nbins { per[b] += o[b + 1] - o[b]; } }
+    let total: i64 = per.iter().sum();
+    let p = nthreads;
+    let target = (total / p as i64).max(1);
+    let mut bounds = vec![0usize]; let mut acc = 0i64;
+    for b in 0..meta.nbins { acc += per[b]; if acc >= target && bounds.len() < p { bounds.push(b + 1); acc = 0; } }
+    bounds.push(meta.nbins);
+    let nranges = bounds.len() - 1;
+    let block = ((mem_gb * 0.3 * 1e9 / (24.0 * nranges as f64)) as usize).min(4_000_000).max(1 << 16);
+    if log { eprintln!("  merge(parallel): {} inputs, {} ranges, block={} pix, assembly={}", paths.len(), nranges, block, asm); }
+
+    let paths_a = Arc::new(paths.to_vec());
+    let offs_a = Arc::new(offs);
+    let res_a: Option<String> = res.map(|s| s.to_string());
+    let mut rxs = Vec::new();
+    let mut handles = Vec::new();
+    for r in 0..nranges {
+        let (lo, hi) = (bounds[r], bounds[r + 1]);
+        let (tx, rx) = crossbeam_channel::bounded::<(Vec<i64>, Vec<i64>, Vec<i32>)>(2);
+        rxs.push(rx);
+        let (pa, oa, ra) = (paths_a.clone(), offs_a.clone(), res_a.clone());
+        let nb = meta.nbins;
+        handles.push(std::thread::spawn(move || -> Result<u64> {
+            let srcs: Vec<CoolerPix> = pa.iter().enumerate().map(|(k, pth)| {
+                let (p0, p1) = (oa[k][lo] as usize, oa[k][hi] as usize);
+                CoolerPix::open_slice(pth, ra.as_deref(), nb, block, p0, p1)
+            }).collect::<Result<_>>()?;
+            merge_sources(srcs, block, |keys, cnts| {
+                let b1 = keys.iter().map(|&x| x / nbins).collect();
+                let b2 = keys.iter().map(|&x| x % nbins).collect();
+                let c = cnts.iter().map(|&x| x as i32).collect();
+                tx.send((b1, b2, c)).map_err(|_| anyhow::anyhow!("merge channel closed")).map(|_| ())
+            })
+        }));
+    }
+    // writer drains ranges in order (range r blocks until produced; later ranges merge concurrently)
+    let mut w = CoolWriter::create(out, &meta.names, &meta.lengths, meta.binsize, meta.nbins, &meta.chrom_offset, comp, &asm)?;
+    let mut nnz = 0u64;
+    for r in 0..nranges {
+        while let Ok((b1, b2, c)) = rxs[r].recv() { w.append(&b1, &b2, &c)?; nnz += b1.len() as u64; }
+    }
+    w.close()?;
+    for h in handles { h.join().unwrap()?; }
+    if log { eprintln!("  merge(parallel) DONE: {} pixels in {:.0}s", nnz, t0.elapsed().as_secs_f64()); }
+    Ok(nnz)
+}
+
 pub fn merge_coolers(
     paths: &[String], res: Option<&str>, out: &str, mem_gb: f64, comp: Comp, assembly: Option<&str>, log: bool,
 ) -> Result<u64> {

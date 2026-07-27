@@ -24,6 +24,7 @@ enum Cmd {
         #[arg(long, default_value = "4.0")] mem: f64,
         #[arg(long, default_value = "blosc:zstd:1")] preset: String,
         #[arg(long)] assembly: Option<String>,
+        #[arg(long, default_value = "8")] threads: usize,
     },
     /// Load a .pairs.gz into a .cool at a fixed resolution
     Cload {
@@ -66,10 +67,10 @@ enum Cmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Merge { out, inputs, res, mem, preset, assembly } => {
+        Cmd::Merge { out, inputs, res, mem, preset, assembly, threads } => {
             let paths: Vec<String> = inputs.iter().map(|s| s.split("::").next().unwrap().to_string()).collect();
             let r = res.or_else(|| inputs[0].split("::").nth(1).map(|g| g.rsplit('/').next().unwrap().to_string()));
-            merge::merge_coolers(&paths, r.as_deref(), &out, mem, cooler::Comp::parse(&preset), assembly.as_deref(), true)?;
+            merge::merge_coolers_parallel(&paths, r.as_deref(), &out, mem, threads, cooler::Comp::parse(&preset), assembly.as_deref(), true)?;
         }
         Cmd::Cload { pairs, binsize, out, mem, threads, preset, assembly } => {
             let tmp = format!("{}.runs", out);

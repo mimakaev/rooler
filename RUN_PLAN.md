@@ -8,5 +8,5 @@
 5. [ ] large-scale zoomify tests on big coolers.
 6. [ ] initial docs.
 7. [ ] git init + commit.
-8. [ ] ranged-parallel merge.
+8. [x] ranged-parallel merge: bin1-range partition, parallel range-merges streamed to writer in order via bounded channels (no temp). VALIDATED exact (h262+v262).
 STRETCH (user): compressed spill, then synthetic ~300B-pair set (perturb existing pairs) -> cload/merge/zoomify @64bp on 64GB RAM.

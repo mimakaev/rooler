@@ -90,7 +90,7 @@ pub struct CoolerPix {
     b2: hdf5::Dataset,
     cn: hdf5::Dataset,
     nbins: i64,
-    npix: usize,
+    end: usize,
     pos: usize,
     block: usize,
     _f: File,
@@ -100,17 +100,30 @@ impl CoolerPix {
         let f = File::open(path)?;
         let g = open_res(&f, res)?;
         let cn = g.dataset("pixels/count")?;
-        let npix = cn.shape()[0];
+        let end = cn.shape()[0];
         Ok(CoolerPix {
             b1: g.dataset("pixels/bin1_id")?, b2: g.dataset("pixels/bin2_id")?, cn,
-            nbins: nbins as i64, npix, pos: 0, block, _f: f,
+            nbins: nbins as i64, end, pos: 0, block, _f: f,
         })
+    }
+    /// reader confined to pixel range [p0, p1) — for a bin1-range partition (ranged-parallel merge).
+    pub fn open_slice(path: &str, res: Option<&str>, nbins: usize, block: usize, p0: usize, p1: usize) -> Result<CoolerPix> {
+        let mut c = Self::open(path, res, nbins, block)?;
+        c.pos = p0; c.end = p1; Ok(c)
+    }
+    /// bin1_offset index for this cooler (for slicing bin1 ranges into pixel ranges).
+    pub fn bin1_offset(path: &str, res: Option<&str>) -> Result<Vec<i64>> {
+        let f = File::open(path)?; let g = open_res(&f, res)?;
+        let mut v = g.dataset("indexes/bin1_offset")?.read_1d::<i64>()?.to_vec();
+        let nbins = g.dataset("bins/start")?.shape()[0];
+        if v.len() == nbins { v.push(g.dataset("pixels/count")?.shape()[0] as i64); }
+        Ok(v)
     }
 }
 impl crate::merge::BlockSource for CoolerPix {
     fn next(&mut self) -> Result<Option<(Vec<i64>, Vec<i64>)>> {
-        if self.pos >= self.npix { return Ok(None); }
-        let hi = std::cmp::min(self.pos + self.block, self.npix);
+        if self.pos >= self.end { return Ok(None); }
+        let hi = std::cmp::min(self.pos + self.block, self.end);
         let b1 = self.b1.read_slice_1d::<i64, _>(self.pos..hi)?;
         let b2 = self.b2.read_slice_1d::<i64, _>(self.pos..hi)?;
         let cn = self.cn.read_slice_1d::<i32, _>(self.pos..hi)?;
