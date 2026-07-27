@@ -25,3 +25,13 @@ e.g. cooler --chunksize 10_000_000 --nproc 8  ->  --mem ~= 3.2 GB.
 ## Defaults set
 cload/merge --mem default = 4 GB (RSS ~5-6 GB). balance --threads 8. All safe on a 32/64 GB box,
 incl. distiller's ~5 parallel merges (5 x ~5 GB = 25 GB < 32).
+
+## Large-scale test results (megacooler: 26.3B pixels, 256bp, 12.5M bins)
+- **balance**: OK, 11.37M/12.54M bins weighted (90.7%), converged. Peak RSS 70 GB (scratch ~52GB +
+  single-thread-build overhead). ~30 min: dominated by (a) single-thread scratch build [now parallelized],
+  (b) IC SpMV hitting the 12M-bin cache-miss wall [tiled kernel = the next perf lever, coolerx showed 2.5x].
+- **merge (10 coolers, ranged-parallel, --threads 8)**: EXACT, peak RSS 8.33 GB (= --mem 8). ~18 min vs
+  28 min single-thread = only ~1.5x. FINDING: at scale merge is WRITE-BOUND (single-thread blosc compress of
+  the 26B-pixel output) + hdf5 crate serializes reads via a global lock. Ranged-parallel helps read+merge, not
+  the serial write. REAL LEVER: parallelize the WRITE (set BLOSC_NTHREADS / blosc filter nthreads, or a
+  multi-threaded writer). ~125% CPU observed confirms write/read-lock bound, not merge-compute bound.
