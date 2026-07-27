@@ -53,3 +53,15 @@ row-chunk (2.55e-16) and cooler. Speed (B=65536, --threads 8):
 LEVERS to close the gap: (1) store bin1 as per-tile CSR (rowptr) instead of per-pixel u32 stream ->
 removes a whole decode stream; (2) B sweep (32k/65k/131k); (3) persistent rayon pool (currently a new
 ThreadPool per spmv/marginals call). CLI: `rooler balance ... --block 65536`. Row-chunk is still default.
+
+## Closing the Rust-vs-C SpMV gap (root cause: rayon fold, not bounds checks)
+Hypothesis was bounds checks; get_unchecked barely moved row-chunk (cache-miss latency HIDES the
+bounds-check branch via out-of-order exec). REAL cause: rayon `.fold(|| vec![0f64;nbins], ...)` creates
+a fresh 96MB accumulator per work-split JOB (many, not nthreads) -> repeated 96MB alloc+zero every SpMV.
+FIX: atomic-counter work-stealing with EXACTLY nthreads accumulators (OpenMP-equivalent). Also get_unchecked.
+256bp monster (2.56B pix, 12.5M bins, 8 threads) BEFORE->AFTER:
+  row-chunk: 201s -> 80s  (IC 21 -> 7.4 s/iter, 0.35 Gpix/s)
+  tiled:     169s -> 62s  (IC 14.6 -> 2.6 s/iter, 0.98 Gpix/s, marginals 25s->3s)
+=> Rust now MATCHES C (coolerx row 0.40 / tiled 0.99 Gpix/s). Tiling = 2.8x on IC (0.35->0.98).
+Overall tiled 62s vs row 80s = 1.3x (tiled BUILD 41 vs 17s is now the limiter -> next: parallelize
+tiled build harder + per-tile CSR for bin1). Both kernels bit-identical (3e-16). Row-chunk still default.

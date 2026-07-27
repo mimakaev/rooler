@@ -8,6 +8,7 @@ use crate::scratch::{dec_count, enc_count, shuffle4, unshuffle4, SpMV};
 use anyhow::Result;
 use lz4_flex::block::{compress, decompress};
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub struct TiledScratch {
     pub nbins: usize,
@@ -119,52 +120,63 @@ impl SpMV for TiledScratch {
 
     fn spmv(&self, v: &[f64], ndiag: i64) -> Vec<f64> {
         let nbins = self.nbins; let ntiles = self.tile_i.len(); let mt = self.max_tile;
+        let counter = AtomicUsize::new(0);
         let pool = rayon::ThreadPoolBuilder::new().num_threads(self.nthreads).build().unwrap();
-        pool.install(|| {
-            (0..ntiles).into_par_iter()
-                .fold(|| (vec![0f64; nbins], Vec::<u8>::new(), vec![0u32; mt], vec![0u32; mt], vec![0i32; mt]),
-                    |(mut ly, mut sh, mut b1, mut b2, mut cn), t| {
-                        let np = self.decode(t, &mut sh, &mut b1, &mut b2, &mut cn);
-                        let ib = self.tile_i[t] as i64 * self.b;
-                        let jb = self.tile_j[t] as i64 * self.b;
-                        for p in 0..np {
-                            let i = (ib + b1[p] as i64) as usize;
-                            let k = (jb + b2[p] as i64) as usize;
-                            if (k as i64) - (i as i64) < ndiag { continue; }
-                            let c = cn[p] as f64;
-                            ly[i] += c * v[k];
-                            if k != i { ly[k] += c * v[i]; }
-                        }
-                        (ly, sh, b1, b2, cn)
-                    })
-                .map(|(ly, ..)| ly)
-                .reduce(|| vec![0f64; nbins], |mut a, b| { for i in 0..nbins { a[i] += b[i]; } a })
-        })
+        let parts: Vec<Vec<f64>> = pool.install(|| {
+            (0..self.nthreads).into_par_iter().map(|_| {
+                let mut ly = vec![0f64; nbins];
+                let (mut sh, mut b1, mut b2, mut cn) = (Vec::<u8>::new(), vec![0u32; mt], vec![0u32; mt], vec![0i32; mt]);
+                loop {
+                    let t = counter.fetch_add(1, Ordering::Relaxed);
+                    if t >= ntiles { break; }
+                    let np = self.decode(t, &mut sh, &mut b1, &mut b2, &mut cn);
+                    let ib = self.tile_i[t] as i64 * self.b;
+                    let jb = self.tile_j[t] as i64 * self.b;
+                    for p in 0..np { unsafe {
+                        let i = (ib + *b1.get_unchecked(p) as i64) as usize;
+                        let k = (jb + *b2.get_unchecked(p) as i64) as usize;
+                        if (k as i64) - (i as i64) < ndiag { continue; }
+                        let c = *cn.get_unchecked(p) as f64;
+                        *ly.get_unchecked_mut(i) += c * *v.get_unchecked(k);
+                        if k != i { *ly.get_unchecked_mut(k) += c * *v.get_unchecked(i); }
+                    }}
+                }
+                ly
+            }).collect()
+        });
+        let mut out = vec![0f64; nbins];
+        for part in &parts { for i in 0..nbins { out[i] += part[i]; } }
+        out
     }
 
     fn marginals(&self, ndiag: i64) -> (Vec<f64>, Vec<f64>) {
         let nbins = self.nbins; let ntiles = self.tile_i.len(); let mt = self.max_tile;
+        let counter = AtomicUsize::new(0);
         let pool = rayon::ThreadPoolBuilder::new().num_threads(self.nthreads).build().unwrap();
-        pool.install(|| {
-            (0..ntiles).into_par_iter()
-                .fold(|| (vec![0f64; nbins], vec![0f64; nbins], Vec::<u8>::new(), vec![0u32; mt], vec![0u32; mt], vec![0i32; mt]),
-                    |(mut mr, mut mn, mut sh, mut b1, mut b2, mut cn), t| {
-                        let np = self.decode(t, &mut sh, &mut b1, &mut b2, &mut cn);
-                        let ib = self.tile_i[t] as i64 * self.b;
-                        let jb = self.tile_j[t] as i64 * self.b;
-                        for p in 0..np {
-                            let i = (ib + b1[p] as i64) as usize;
-                            let k = (jb + b2[p] as i64) as usize;
-                            if (k as i64) - (i as i64) < ndiag { continue; }
-                            let c = cn[p] as f64;
-                            mr[i] += c; mn[i] += 1.0;
-                            if k != i { mr[k] += c; mn[k] += 1.0; }
-                        }
-                        (mr, mn, sh, b1, b2, cn)
-                    })
-                .map(|(mr, mn, ..)| (mr, mn))
-                .reduce(|| (vec![0f64; nbins], vec![0f64; nbins]),
-                    |mut a, b| { for i in 0..nbins { a.0[i] += b.0[i]; a.1[i] += b.1[i]; } a })
-        })
+        let parts: Vec<(Vec<f64>, Vec<f64>)> = pool.install(|| {
+            (0..self.nthreads).into_par_iter().map(|_| {
+                let (mut mr, mut mn) = (vec![0f64; nbins], vec![0f64; nbins]);
+                let (mut sh, mut b1, mut b2, mut cn) = (Vec::<u8>::new(), vec![0u32; mt], vec![0u32; mt], vec![0i32; mt]);
+                loop {
+                    let t = counter.fetch_add(1, Ordering::Relaxed);
+                    if t >= ntiles { break; }
+                    let np = self.decode(t, &mut sh, &mut b1, &mut b2, &mut cn);
+                    let ib = self.tile_i[t] as i64 * self.b;
+                    let jb = self.tile_j[t] as i64 * self.b;
+                    for p in 0..np { unsafe {
+                        let i = (ib + *b1.get_unchecked(p) as i64) as usize;
+                        let k = (jb + *b2.get_unchecked(p) as i64) as usize;
+                        if (k as i64) - (i as i64) < ndiag { continue; }
+                        let c = *cn.get_unchecked(p) as f64;
+                        *mr.get_unchecked_mut(i) += c; *mn.get_unchecked_mut(i) += 1.0;
+                        if k != i { *mr.get_unchecked_mut(k) += c; *mn.get_unchecked_mut(k) += 1.0; }
+                    }}
+                }
+                (mr, mn)
+            }).collect()
+        });
+        let (mut mr, mut mn) = (vec![0f64; nbins], vec![0f64; nbins]);
+        for (a, b) in &parts { for i in 0..nbins { mr[i] += a[i]; mn[i] += b[i]; } }
+        (mr, mn)
     }
 }

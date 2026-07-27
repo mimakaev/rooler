@@ -15,9 +15,12 @@ pub(crate) fn shuffle4(src: &[u32]) -> Vec<u8> {
     o
 }
 pub(crate) fn unshuffle4(buf: &[u8], n: usize, out: &mut [u32]) {
-    for i in 0..n {
-        out[i] = u32::from_le_bytes([buf[i], buf[n + i], buf[2 * n + i], buf[3 * n + i]]);
-    }
+    // safety: caller guarantees buf.len() >= 4*n and out.len() >= n
+    for i in 0..n { unsafe {
+        *out.get_unchecked_mut(i) = u32::from_le_bytes([
+            *buf.get_unchecked(i), *buf.get_unchecked(n + i),
+            *buf.get_unchecked(2 * n + i), *buf.get_unchecked(3 * n + i)]);
+    }}
 }
 // count codec: [u32 nexc][u32 idx*nexc][u32 val*nexc][lz4(u8 base)]  (base_len = npix known by caller)
 pub(crate) fn enc_count(cn: &[i32]) -> Vec<u8> {
@@ -151,32 +154,37 @@ impl Scratch {
         let nbins = self.nbins;
         let nchunks = self.chunk_row.len() - 1;
         let mcp = self.max_chunk_pix;
+        let counter = std::sync::atomic::AtomicUsize::new(0);
         let pool = rayon::ThreadPoolBuilder::new().num_threads(self.nthreads).build().unwrap();
-        pool.install(|| {
-            (0..nchunks).into_par_iter()
-                .fold(|| (vec![0f64; nbins], Vec::<u8>::new(), vec![0u32; mcp], vec![0i32; mcp]),
-                    |(mut ly, mut sh, mut b2, mut cn), c| {
-                        let (r0, r1, npix) = self.decode_chunk(c, &mut sh, &mut b2, &mut cn);
-                        if npix > 0 {
-                            let p0 = self.rowptr[r0];
-                            for r in r0..r1 {
-                                let (s, e) = ((self.rowptr[r] - p0) as usize, (self.rowptr[r + 1] - p0) as usize);
-                                let vi = v[r]; let mut acc = 0.0;
-                                for j in s..e {
-                                    let k = b2[j] as usize;
-                                    if (k as i64) - (r as i64) < ndiag { continue; }
-                                    let cc = cn[j] as f64;
-                                    acc += cc * v[k];
-                                    if k != r { ly[k] += cc * vi; }
-                                }
-                                ly[r] += acc;
-                            }
+        let parts: Vec<Vec<f64>> = pool.install(|| {
+            (0..self.nthreads).into_par_iter().map(|_| {
+                let mut ly = vec![0f64; nbins];
+                let (mut sh, mut b2, mut cn) = (Vec::<u8>::new(), vec![0u32; mcp], vec![0i32; mcp]);
+                loop {
+                    let c = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if c >= nchunks { break; }
+                    let (r0, r1, npix) = self.decode_chunk(c, &mut sh, &mut b2, &mut cn);
+                    if npix == 0 { continue; }
+                    let p0 = self.rowptr[r0];
+                    for r in r0..r1 {
+                        let (s, e) = ((self.rowptr[r] - p0) as usize, (self.rowptr[r + 1] - p0) as usize);
+                        let vi = unsafe { *v.get_unchecked(r) }; let mut acc = 0.0;
+                        for j in s..e {
+                            let k = unsafe { *b2.get_unchecked(j) } as usize; // k=bin2 < nbins
+                            if (k as i64) - (r as i64) < ndiag { continue; }
+                            let cc = unsafe { *cn.get_unchecked(j) } as f64;
+                            acc += cc * unsafe { *v.get_unchecked(k) };
+                            if k != r { unsafe { *ly.get_unchecked_mut(k) += cc * vi; } }
                         }
-                        (ly, sh, b2, cn)
-                    })
-                .map(|(ly, ..)| ly)
-                .reduce(|| vec![0f64; nbins], |mut a, b| { for i in 0..nbins { a[i] += b[i]; } a })
-        })
+                        unsafe { *ly.get_unchecked_mut(r) += acc; }
+                    }
+                }
+                ly
+            }).collect()
+        });
+        let mut out = vec![0f64; nbins];
+        for part in &parts { for i in 0..nbins { out[i] += part[i]; } }
+        out
     }
 
     /// raw marginal (sum of counts) and nnz marginal, both symmetric + diag-zeroed.
@@ -184,31 +192,35 @@ impl Scratch {
         let nbins = self.nbins;
         let nchunks = self.chunk_row.len() - 1;
         let mcp = self.max_chunk_pix;
+        let counter = std::sync::atomic::AtomicUsize::new(0);
         let pool = rayon::ThreadPoolBuilder::new().num_threads(self.nthreads).build().unwrap();
-        pool.install(|| {
-            (0..nchunks).into_par_iter()
-                .fold(|| (vec![0f64; nbins], vec![0f64; nbins], Vec::<u8>::new(), vec![0u32; mcp], vec![0i32; mcp]),
-                    |(mut mr, mut mn, mut sh, mut b2, mut cn), c| {
-                        let (r0, r1, npix) = self.decode_chunk(c, &mut sh, &mut b2, &mut cn);
-                        if npix > 0 {
-                            let p0 = self.rowptr[r0];
-                            for r in r0..r1 {
-                                let (s, e) = ((self.rowptr[r] - p0) as usize, (self.rowptr[r + 1] - p0) as usize);
-                                for j in s..e {
-                                    let k = b2[j] as usize;
-                                    if (k as i64) - (r as i64) < ndiag { continue; }
-                                    let cc = cn[j] as f64;
-                                    mr[r] += cc; mn[r] += 1.0;
-                                    if k != r { mr[k] += cc; mn[k] += 1.0; }
-                                }
-                            }
+        let parts: Vec<(Vec<f64>, Vec<f64>)> = pool.install(|| {
+            (0..self.nthreads).into_par_iter().map(|_| {
+                let (mut mr, mut mn) = (vec![0f64; nbins], vec![0f64; nbins]);
+                let (mut sh, mut b2, mut cn) = (Vec::<u8>::new(), vec![0u32; mcp], vec![0i32; mcp]);
+                loop {
+                    let c = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if c >= nchunks { break; }
+                    let (r0, r1, npix) = self.decode_chunk(c, &mut sh, &mut b2, &mut cn);
+                    if npix == 0 { continue; }
+                    let p0 = self.rowptr[r0];
+                    for r in r0..r1 {
+                        let (s, e) = ((self.rowptr[r] - p0) as usize, (self.rowptr[r + 1] - p0) as usize);
+                        for j in s..e {
+                            let k = unsafe { *b2.get_unchecked(j) } as usize;
+                            if (k as i64) - (r as i64) < ndiag { continue; }
+                            let cc = unsafe { *cn.get_unchecked(j) } as f64;
+                            unsafe { *mr.get_unchecked_mut(r) += cc; *mn.get_unchecked_mut(r) += 1.0;
+                                if k != r { *mr.get_unchecked_mut(k) += cc; *mn.get_unchecked_mut(k) += 1.0; } }
                         }
-                        (mr, mn, sh, b2, cn)
-                    })
-                .map(|(mr, mn, ..)| (mr, mn))
-                .reduce(|| (vec![0f64; nbins], vec![0f64; nbins]),
-                    |mut a, b| { for i in 0..nbins { a.0[i] += b.0[i]; a.1[i] += b.1[i]; } a })
-        })
+                    }
+                }
+                (mr, mn)
+            }).collect()
+        });
+        let (mut mr, mut mn) = (vec![0f64; nbins], vec![0f64; nbins]);
+        for (a, b) in &parts { for i in 0..nbins { mr[i] += a[i]; mn[i] += b[i]; } }
+        (mr, mn)
     }
 }
 
