@@ -1,5 +1,7 @@
 # rooler — Rust cooler engine, build progress
 
+> Historical build log. For current state, code-review findings, and the roadmap see **STATUS.md**.
+
 Host: `/ssdhome/magus/work/cooler-redo/rooler/`. Toolchain: rust 1.97, libhdf5 1.10.10 (`hdf5-metno` crate).
 Build: `source ~/.cargo/env && cargo build --release`. Binary: `target/release/rooler`.
 
