@@ -120,9 +120,16 @@ fn worker(rx: Receiver<Vec<u8>>, bins: Arc<Bins>, cap: usize, tmpdir: Arc<String
 pub fn cload(pairs: &str, binsize: i64, out: &str, mem_gb: f64, nthreads: usize,
              comp: Comp, tmpdir: &str, assembly: Option<&str>, log: bool) -> Result<u64> {
     let t0 = std::time::Instant::now();
-    let mut child = Command::new("bgzip").args(["-dc", "-@", &nthreads.to_string(), pairs])
-        .stdout(Stdio::piped()).spawn()?;
-    let mut rd = child.stdout.take().ok_or_else(|| anyhow!("no bgzip stdout"))?;
+    // ".gz" -> parallel bgzip decode; "-" -> stdin; anything else -> plain text on disk
+    let mut child = if pairs.ends_with(".gz") {
+        Some(Command::new("bgzip").args(["-dc", "-@", &nthreads.to_string(), pairs])
+            .stdout(Stdio::piped()).spawn()?)
+    } else { None };
+    let mut rd: Box<dyn Read> = match child.as_mut() {
+        Some(c) => Box::new(c.stdout.take().ok_or_else(|| anyhow!("no bgzip stdout"))?),
+        None if pairs == "-" => Box::new(std::io::stdin()),
+        None => Box::new(std::fs::File::open(pairs)?),
+    };
 
     // --- parse header (chromsizes) ---
     let mut names: Vec<String> = Vec::new();
@@ -190,7 +197,8 @@ pub fn cload(pairs: &str, binsize: i64, out: &str, mem_gb: f64, nthreads: usize,
     }
     if !tail.is_empty() { tail.push(b'\n'); tx.send(tail).ok(); }
     drop(tx);
-    child.wait()?;
+    drop(rd);
+    if let Some(mut c) = child { c.wait()?; }
 
     let mut run_paths = Vec::new(); let mut npairs = 0u64;
     for h in handles { let (p, np) = h.join().unwrap()?; run_paths.extend(p); npairs += np; }

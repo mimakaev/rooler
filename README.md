@@ -55,6 +55,29 @@ For cooltools, use `cooler.Cooler(rooler_file)` directly — the files are coole
 `--mem` is the RAM knob; peak RSS ≈ `--mem` + O(nbins) overhead for cload/merge. balance sizes a
 compressed scratch (~2 B/pixel) to the data (no `--mem`). See `MEMORY_CALIBRATION.md`.
 
+## Tests
+```
+cargo test --release          # ~0.6s, no python / network / fixture files needed
+```
+- **Unit tests** cover the codecs (bin2-delta shuffle+LZ4, u8+exception counts, spill runs),
+  the k-way drain-and-count merge, pairs line parsing, the coarsening bin map, genome views,
+  and the cooler writer (round-trip, index validity, append ordering, preset parsing).
+- **`tests/pipeline.rs`** runs the whole chain — synthetic pairs → cload → merge → zoomify →
+  balance → expected — against independent in-test oracles: a HashMap pixel table for
+  cload/merge/zoomify, a marginal-flatness (CV) property check plus row-vs-tiled agreement for
+  balance, and a brute-force O(n²) recomputation for expected. It also asserts cload is
+  invariant to `--mem`/`--threads`, and that the ops refuse mystery coolers, mismatched merges
+  and unbalanced `expected`.
+
+*Embedding note:* the ops open the file read-write, so drop every HDF5 handle — `Group` and
+`Dataset` too, not just `File` — before calling the next op on the same file in-process.
+
+External cross-check against python cooler (manual, needs h5py/cooler):
+```
+scripts/validate_vs_cooler.py a.cool b.cool [--grp resolutions/1000] [--region chr1:0-5,000,000]
+scripts/validate_vs_cooler.py a.cool --self-check
+```
+
 ## Validation (vs cooler / cooltools, on real data)
 - cload/merge/zoomify: pixel-exact vs numpy reference / cooler.coarsen_cooler.
 - balance: weights median rel diff **6e-6** vs `cooler.balance_cooler` (0 mask disagreements).
@@ -62,5 +85,6 @@ compressed scratch (~2 B/pixel) to the data (no `--mem`). See `MEMORY_CALIBRATIO
 - Full chain cload→zoomify→balance runs end-to-end; the balanced mcool works in cooler + cooltools.
 
 ## Status
-Working: cload, merge, zoomify, balance, expected, read API, assembly enforcement. See `PROGRESS.md`.
-Roadmap: compressed spill (DONE, 4.5x less IO); noodles-bgzf; more arm tables; KR (deprioritized).
+Working: cload, merge, zoomify, balance, expected, read API, assembly enforcement.
+See `STATUS.md` for the current state + review findings, `PLAN.md` for the roadmap,
+`PROGRESS.md` for the historical build log.
