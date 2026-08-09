@@ -70,8 +70,12 @@ Bugs caught by the new tests before they reached data:
   keeps the file open and makes the next op's read-write open fail confusingly.
 
 ## Known limits / open items
-- **balance is RAM-bound by design**: it holds a ~2–2.5 B/pixel scratch in memory, so a 100B+
-  pixel cooler needs hundreds of GB. cload/merge/zoomify are streaming and are not.
+- **balance scratch spills to a disk-backed mmap past `--mem` (default 8 GB)** — anonymous RAM
+  stays O(nbins) (2.4 GB anon at 2.56 B pix / 12.5 M bins) and results are identical; the cost
+  is disk traffic per matvec when the page cache can't hold the scratch (~2.5 B/pixel of it).
+  A 100 B-pixel balance is therefore *possible* on a workstation but NVMe-bound: ~250 GB of
+  scratch re-read per iteration when far beyond RAM. The kernel (row vs tiled) also
+  auto-routes now (tiled at ≥4 M bins, `--block 0`/`--block B` to override).
 - Chrom lengths are stored i32 → 2.1 Gb per chromosome (same limit as cooler; now a loud
   refusal instead of a silent wrap).
 - `read_meta` reads fixed-length chrom names only (variable-length string names from foreign

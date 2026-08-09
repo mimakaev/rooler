@@ -175,23 +175,17 @@ mod tests {
 /// while any File/Group/Dataset from the build is still alive.
 pub fn zoomify_and_balance(
     src: &str, out: &str, resolutions: Option<Vec<i64>>, comp: Comp, assembly: Option<&str>,
-    balance: bool, nthreads: usize, log: bool,
+    balance: bool, nthreads: usize, mem_gb: f64, log: bool,
 ) -> Result<()> {
     let reslist = zoomify(src, out, resolutions, comp, assembly, log)?;
     if !balance { return Ok(()); }
     let t0 = Instant::now();
     for res in &reslist {
         let uri = format!("{}::resolutions/{}", out, res);
-        let nbins = {
-            let m = crate::cooler::read_meta(out, Some(&res.to_string()))?;
-            m.nbins
-        };
-        // cache-blocked SpMV pays off once the marginal vectors stop fitting in L3
-        let tiled_block = if nbins >= 4_000_000 { Some(65536) } else { None };
-        if log { eprintln!("  [zoomify] balancing {}bp ({} bins){}", res, nbins,
-            if tiled_block.is_some() { ", tiled" } else { "" }); }
+        if log { eprintln!("  [zoomify] balancing {}bp", res); }
+        // kernel choice (row vs tiled) and scratch placement (RAM vs disk) auto-route in balance
         crate::balance::balance(&uri, crate::balance::Params {
-            nthreads, tiled_block, ..Default::default() }, log)?;
+            nthreads, mem_gb, ..Default::default() }, log)?;
     }
     if log { eprintln!("  zoomify: balanced {} resolutions in {:.0}s", reslist.len(), t0.elapsed().as_secs_f64()); }
     Ok(())

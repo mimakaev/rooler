@@ -13,10 +13,16 @@ pub struct Params {
     pub tol: f64,   // scale-free: stop when CV=std/mean of the marginal < tol
     pub max_iters: usize,
     pub nthreads: usize,
+    /// None = auto (tiled above 4M bins); Some(0) = force row-chunk; Some(b) = tiled, tile size b
     pub tiled_block: Option<i64>,
+    /// RAM budget in GB. When the estimated scratch would exceed it, blobs go to a disk-backed
+    /// mmap next to the cooler instead of the heap (identical results, page-cache speed when
+    /// memory is free). Default 8: distiller runs ~8 balances in parallel on a 64GB node.
+    pub mem_gb: f64,
 }
 impl Default for Params {
-    fn default() -> Self { Params { ignore_diags: 2, mad_max: 5.0, min_nnz: 10.0, min_count: 0.0, tol: 1e-4, max_iters: 200, nthreads: 8, tiled_block: None } }
+    fn default() -> Self { Params { ignore_diags: 2, mad_max: 5.0, min_nnz: 10.0, min_count: 0.0,
+        tol: 1e-4, max_iters: 200, nthreads: 8, tiled_block: None, mem_gb: 8.0 } }
 }
 
 fn median(v: &mut [f64]) -> f64 {
@@ -31,13 +37,36 @@ pub fn balance(uri: &str, p: Params, log: bool) -> Result<()> {
     let (path, grp) = match uri.split_once("::") { Some((a, b)) => (a.to_string(), b.to_string()), None => (uri.to_string(), "/".to_string()) };
     let f = File::append(&path)?;
     let g = if grp == "/" { f.group("/")? } else { f.group(&grp)? };
-    let sc: Box<dyn SpMV> = match p.tiled_block {
-        Some(b) => Box::new(TiledScratch::build(&g, b, p.nthreads)?),
-        None => Box::new(Scratch::build(&g, 262144, p.nthreads)?),
+    // probe sizes (dataset shapes only) to route the kernel and place the scratch
+    let nbins_probe = g.dataset("bins/start")?.shape()[0];
+    let nnz_probe = g.dataset("pixels/count")?.shape()[0];
+    // kernel auto-route: tiling pays once the O(nbins) SpMV vectors outgrow L3 — at 4M bins the
+    // v + per-thread y vectors are 64MB, past any common L3 (measured 2.8x at 12.5M bins). The
+    // tile size itself (65536 x 8B = 512KB slices) is the L2-sizing knob inside the kernel.
+    let block = match p.tiled_block {
+        Some(0) => None,
+        Some(b) => Some(b),
+        None => if nbins_probe >= 4_000_000 { Some(65536) } else { None },
+    };
+    // scratch placement: estimated compressed size (measured ~2.5 B/pix row / ~2.8 tiled; use a
+    // margin) plus the O(nbins) vectors we hold regardless (rowptr, bias/y, per-thread partials)
+    let est_scratch = (nnz_probe as f64 * if block.is_some() { 3.0 } else { 2.6 }) as usize;
+    let est_fixed = (p.nthreads + 6) * nbins_probe * 8;
+    let budget = (p.mem_gb * 1e9) as usize;
+    let spill_prefix = if est_scratch + est_fixed > budget {
+        let pfx = format!("{}.balance_scratch.{}", path, std::process::id());
+        if log { eprintln!("  scratch est {:.1}GB + vectors {:.1}GB > --mem {:.1}GB -> disk-backed mmap scratch",
+            est_scratch as f64 / 1e9, est_fixed as f64 / 1e9, p.mem_gb); }
+        Some(pfx)
+    } else { None };
+    let sc: Box<dyn SpMV> = match block {
+        Some(b) => Box::new(TiledScratch::build(&g, b, p.nthreads, spill_prefix.as_deref())?),
+        None => Box::new(Scratch::build(&g, 262144, p.nthreads, spill_prefix.as_deref())?),
     };
     let nbins = sc.nbins();
-    if log { eprintln!("  scratch({}): {} pix -> {:.1}GB ({:.2} B/pix) in {:.0}s",
-        p.tiled_block.map(|b| format!("tiled B={}", b)).unwrap_or("row".into()),
+    if log { eprintln!("  scratch({}{}): {} pix -> {:.1}GB ({:.2} B/pix) in {:.0}s",
+        block.map(|b| format!("tiled B={}", b)).unwrap_or("row".into()),
+        if spill_prefix.is_some() { ", disk" } else { "" },
         sc.nnz(), sc.comp_bytes() as f64 / 1e9, sc.comp_bytes() as f64 / sc.nnz().max(1) as f64, t0.elapsed().as_secs_f64()); }
 
     // mask from raw marginals

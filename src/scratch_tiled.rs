@@ -4,7 +4,7 @@
 //! confined to the I- and J-block slices (<=B elems each -> L2-resident) -> kills the cache-miss wall
 //! at 12M bins. Same result as the row-chunk scratch. Build: counting-sort each I-block band by J,
 //! encode tiles in parallel.
-use crate::scratch::{dec_count, enc_count, shuffle4, unshuffle4, SpMV};
+use crate::scratch::{dec_count, enc_count, shuffle4, unshuffle4, BlobSink, BlobStore, SpMV};
 use anyhow::Result;
 use lz4_flex::block::{compress, decompress};
 use rayon::prelude::*;
@@ -18,15 +18,16 @@ pub struct TiledScratch {
     tile_i: Vec<i32>,
     tile_j: Vec<i32>,
     tile_np: Vec<i64>,
-    b1_blob: Vec<u8>, b1_off: Vec<i64>,
-    b2_blob: Vec<u8>, b2_off: Vec<i64>,
-    cn_blob: Vec<u8>, cn_off: Vec<i64>,
+    b1_blob: BlobStore, b1_off: Vec<i64>,
+    b2_blob: BlobStore, b2_off: Vec<i64>,
+    cn_blob: BlobStore, cn_off: Vec<i64>,
     max_tile: usize,
     nthreads: usize,
 }
 
 impl TiledScratch {
-    pub fn build(g: &hdf5::Group, block: i64, nthreads: usize) -> Result<TiledScratch> {
+    /// `spill`: None -> blobs in RAM; Some(prefix) -> blobs in unlinked mmap'd files "{prefix}.*".
+    pub fn build(g: &hdf5::Group, block: i64, nthreads: usize, spill: Option<&str>) -> Result<TiledScratch> {
         let nbins = g.dataset("bins/start")?.shape()[0];
         let nnz = g.dataset("pixels/count")?.shape()[0];
         let mut rowptr: Vec<i64> = g.dataset("indexes/bin1_offset")?.read_1d::<i64>()?.to_vec();
@@ -39,7 +40,9 @@ impl TiledScratch {
         let pool = rayon::ThreadPoolBuilder::new().num_threads(nthreads).build().unwrap();
 
         let (mut tile_i, mut tile_j, mut tile_np) = (Vec::new(), Vec::new(), Vec::new());
-        let (mut b1_blob, mut b2_blob, mut cn_blob) = (Vec::new(), Vec::new(), Vec::new());
+        let mut b1_blob = BlobSink::new(spill, "b1")?;
+        let mut b2_blob = BlobSink::new(spill, "b2")?;
+        let mut cn_blob = BlobSink::new(spill, "cn")?;
         let (mut b1_off, mut b2_off, mut cn_off) = (vec![0i64], vec![0i64], vec![0i64]);
         let mut max_tile = 1usize;
 
@@ -50,7 +53,8 @@ impl TiledScratch {
             let r1 = ((ib + 1) * bsz).min(nbins);
             rowptr[r1] - rowptr[ib * bsz]
         };
-        let read_block = 50_000_000i64; // pixels per HDF5 read batch
+        // spilling implies a tight budget -> smaller read batches (a batch is ~12 B/pixel of heap)
+        let read_block = if spill.is_some() { 20_000_000i64 } else { 50_000_000i64 };
         let mut ib = 0usize;
         while ib < nblocks {
             let bstart = ib;
@@ -113,12 +117,13 @@ impl TiledScratch {
                 for (j, np, b1c, b2c, cnc) in band {
                     tile_i.push(ibb as i32); tile_j.push(j as i32); tile_np.push(np as i64);
                     max_tile = max_tile.max(np);
-                    b1_blob.extend_from_slice(&b1c); b1_off.push(b1_off.last().unwrap() + b1c.len() as i64);
-                    b2_blob.extend_from_slice(&b2c); b2_off.push(b2_off.last().unwrap() + b2c.len() as i64);
-                    cn_blob.extend_from_slice(&cnc); cn_off.push(cn_off.last().unwrap() + cnc.len() as i64);
+                    b1_blob.append(&b1c)?; b1_off.push(b1_off.last().unwrap() + b1c.len() as i64);
+                    b2_blob.append(&b2c)?; b2_off.push(b2_off.last().unwrap() + b2c.len() as i64);
+                    cn_blob.append(&cnc)?; cn_off.push(cn_off.last().unwrap() + cnc.len() as i64);
                 }
             }
         }
+        let (b1_blob, b2_blob, cn_blob) = (b1_blob.finish()?, b2_blob.finish()?, cn_blob.finish()?);
         Ok(TiledScratch {
             nbins, nnz, chrom_offset, b: block, tile_i, tile_j, tile_np,
             b1_blob, b1_off, b2_blob, b2_off, cn_blob, cn_off, max_tile, nthreads,
@@ -127,11 +132,11 @@ impl TiledScratch {
 
     fn decode(&self, t: usize, sh: &mut Vec<u8>, b1: &mut [u32], b2: &mut [u32], cn: &mut [i32]) -> usize {
         let np = self.tile_np[t] as usize;
-        let d1 = decompress(&self.b1_blob[self.b1_off[t] as usize..self.b1_off[t + 1] as usize], 4 * np).unwrap();
+        let d1 = decompress(&self.b1_blob.bytes()[self.b1_off[t] as usize..self.b1_off[t + 1] as usize], 4 * np).unwrap();
         sh.clear(); sh.extend_from_slice(&d1); unshuffle4(sh, np, &mut b1[..np]);
-        let d2 = decompress(&self.b2_blob[self.b2_off[t] as usize..self.b2_off[t + 1] as usize], 4 * np).unwrap();
+        let d2 = decompress(&self.b2_blob.bytes()[self.b2_off[t] as usize..self.b2_off[t + 1] as usize], 4 * np).unwrap();
         sh.clear(); sh.extend_from_slice(&d2); unshuffle4(sh, np, &mut b2[..np]);
-        dec_count(&self.cn_blob[self.cn_off[t] as usize..self.cn_off[t + 1] as usize], np, &mut cn[..np]);
+        dec_count(&self.cn_blob.bytes()[self.cn_off[t] as usize..self.cn_off[t + 1] as usize], np, &mut cn[..np]);
         np
     }
 }

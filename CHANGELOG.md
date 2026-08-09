@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Added
+- **`balance` now honors a `--mem` budget (default 8 GB) and is no longer RAM-only.** When the
+  estimated compressed scratch plus working vectors exceed the budget, the scratch blobs are
+  written to an unlinked temp file next to the cooler and mmap'd read-only instead of held on
+  the heap. Results are identical; anonymous memory stays O(nbins) (measured: 2.56 B-pixel /
+  12.5 M-bin balance at `--mem 8` peaks at **2.4 GB anon RSS** vs 8.6 GB in-RAM, 59 s vs 50 s
+  with a warm page cache). The mmap pages are file-backed and evictable, so 8 balances sharing
+  a 64 GB node degrade gracefully instead of OOMing. Temp files are unlinked immediately after
+  mapping — nothing leaks even on SIGKILL. `zoomify --balance` takes the same `--mem`.
+- **`balance --block` now auto-routes.** Default: tiled SpMV (B=65536) at ≥4 M bins — where
+  the O(nbins) vectors outgrow L3 and tiling measured 2.8× — row-chunk below. `--block 0`
+  forces row-chunk; an explicit `--block B` forces tiled. (`zoomify --balance` previously had
+  this auto-pick; plain `balance` defaulted to row-chunk at any size.)
+
 Review-fix batch (post-alpha code review; all outputs verified pixel-identical to alpha.1
 where behavior was meant to be unchanged, and the 1.1 B-pixel gzip merge benchmark shows no
 performance regression).

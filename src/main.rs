@@ -46,6 +46,8 @@ enum Cmd {
         /// balance every resolution after building (distiller-style)
         #[arg(long)] balance: bool,
         #[arg(long, alias = "nproc", default_value = "8")] threads: usize,
+        /// RAM budget in GB for the balancing passes (scratch spills to disk-backed mmap beyond it)
+        #[arg(long, default_value = "8.0")] mem: f64,
     },
     /// Balance a cooler (genome-wide IC); writes bins/weight
     Balance {
@@ -57,7 +59,10 @@ enum Cmd {
         #[arg(long, default_value="1e-4")] tol: f64,
         #[arg(long, default_value="200")] max_iters: usize,
         #[arg(long, alias = "nproc", default_value="8")] threads: usize,
+        /// SpMV tile size. Default: auto (tiled 65536 above 4M bins, row-chunk below). 0 forces row-chunk.
         #[arg(long)] block: Option<i64>,
+        /// RAM budget in GB; the scratch spills to a disk-backed mmap beyond it (same results)
+        #[arg(long, default_value="8.0")] mem: f64,
     },
     /// Compute + store cis expected P(s) per region (arms/chroms)
     Expected {
@@ -98,12 +103,13 @@ fn main() -> Result<()> {
             cload::cload(&pairs, binsize, &out, mem, threads, cooler::Comp::parse(&preset)?, &tmp,
                 assembly.as_deref(), !zero_based, true)?;
         }
-        Cmd::Zoomify { src, out, resolutions, preset, assembly, balance, threads } => {
+        Cmd::Zoomify { src, out, resolutions, preset, assembly, balance, threads, mem } => {
             zoomify::zoomify_and_balance(&src, &out, resolutions, cooler::Comp::parse(&preset)?,
-                assembly.as_deref(), balance, threads, true)?;
+                assembly.as_deref(), balance, threads, mem, true)?;
         }
-        Cmd::Balance { uri, ignore_diags, mad_max, min_nnz, min_count, tol, max_iters, threads, block } => {
-            balance::balance(&uri, balance::Params{ignore_diags, mad_max, min_nnz, min_count, tol, max_iters, nthreads: threads, tiled_block: block}, true)?;
+        Cmd::Balance { uri, ignore_diags, mad_max, min_nnz, min_count, tol, max_iters, threads, block, mem } => {
+            balance::balance(&uri, balance::Params{ignore_diags, mad_max, min_nnz, min_count, tol,
+                max_iters, nthreads: threads, tiled_block: block, mem_gb: mem}, true)?;
         }
         Cmd::Expected { uri, view } => {
             expected::expected(&uri, view.as_deref(), true)?;

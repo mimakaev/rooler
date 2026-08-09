@@ -27,6 +27,7 @@ rustfft = "6"
 num-complex = "0.4"
 libdeflater = "1.25.2"
 hdf5-metno-sys = "0.10.1"
+memmap2 = "0.9"
 
 [profile.release]
 opt-level = 3

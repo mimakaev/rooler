@@ -165,7 +165,7 @@ fn full_pipeline_matches_oracles() -> Result<()> {
     let uri = format!("{}::{}", mc, g_fine);
     balance::balance(&uri, balance::Params {
         ignore_diags: 0, mad_max: 0.0, min_nnz: 2.0, min_count: 0.0,
-        tol: 1e-8, max_iters: 500, nthreads: 4, tiled_block: None }, false)?;
+        tol: 1e-8, max_iters: 500, nthreads: 4, tiled_block: Some(0), mem_gb: 8.0 }, false)?;
     let w = read_f64(&mc, &g_fine, "bins/weight")?;
     assert_eq!(w.len(), case.nbins as usize);
     let ngood = w.iter().filter(|x| x.is_finite()).count();
@@ -191,13 +191,27 @@ fn full_pipeline_matches_oracles() -> Result<()> {
     let w_row = w.clone();
     balance::balance(&uri, balance::Params {
         ignore_diags: 0, mad_max: 0.0, min_nnz: 2.0, min_count: 0.0,
-        tol: 1e-8, max_iters: 500, nthreads: 4, tiled_block: Some(64) }, false)?;
+        tol: 1e-8, max_iters: 500, nthreads: 4, tiled_block: Some(64), mem_gb: 8.0 }, false)?;
     let w_tiled = read_f64(&mc, &g_fine, "bins/weight")?;
     for i in 0..w_row.len() {
         assert_eq!(w_row[i].is_finite(), w_tiled[i].is_finite(), "mask differs at bin {}", i);
         if w_row[i].is_finite() {
             let rel = (w_row[i] - w_tiled[i]).abs() / w_row[i].abs();
             assert!(rel < 1e-9, "tiled vs row weight at bin {}: {} vs {}", i, w_row[i], w_tiled[i]);
+        }
+    }
+
+    // a disk-backed scratch (forced by a tiny --mem) must reproduce the in-RAM weights: the
+    // decode/compute path is identical, only where the compressed blobs live differs
+    balance::balance(&uri, balance::Params {
+        ignore_diags: 0, mad_max: 0.0, min_nnz: 2.0, min_count: 0.0,
+        tol: 1e-8, max_iters: 500, nthreads: 4, tiled_block: Some(0), mem_gb: 1e-6 }, false)?;
+    let w_disk = read_f64(&mc, &g_fine, "bins/weight")?;
+    for i in 0..w_row.len() {
+        assert_eq!(w_row[i].is_finite(), w_disk[i].is_finite(), "disk-scratch mask differs at bin {}", i);
+        if w_row[i].is_finite() {
+            let rel = (w_row[i] - w_disk[i]).abs() / w_row[i].abs();
+            assert!(rel < 1e-9, "disk vs ram weight at bin {}: {} vs {}", i, w_row[i], w_disk[i]);
         }
     }
 
@@ -282,7 +296,7 @@ fn zoomify_balance_covers_every_level() -> Result<()> {
     let mc = p("out.mcool");
     let levels = vec![BINSIZE, BINSIZE * 2, BINSIZE * 4];
     zoomify::zoomify_and_balance(&base, &mc, Some(levels.clone()), Comp::parse("blosc:zstd:1")?,
-        None, true, 4, false)?;
+        None, true, 4, 8.0, false)?;
     for res in &levels {
         let g = format!("resolutions/{}", res);
         let w = read_f64(&mc, &g, "bins/weight")?;

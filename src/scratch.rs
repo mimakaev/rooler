@@ -1,9 +1,68 @@
 //! Compressed row-chunk CSR scratch for fast repeated SpMV (balance). Built once from a cooler;
 //! bin2 = within-row-delta u32 + byte-shuffle + LZ4; count = u8 base + u32 exceptions + LZ4.
 //! Held in RAM (compressed ~2 B/pixel). Parallel (rayon) marginals/SpMV with per-thread reduction.
-use anyhow::Result;
+use anyhow::{Context, Result};
 use lz4_flex::block::{compress, decompress};
 use rayon::prelude::*;
+
+/// Where a scratch blob lives: RAM (default), or an **unlinked** temp file mapped read-only when
+/// the scratch would blow the `--mem` budget. The mmap path is page-cache friendly: on an idle
+/// box the kernel keeps it resident and it performs like RAM; under memory pressure pages are
+/// evicted and re-read from disk, so *anonymous* memory stays O(nbins) either way. Unlinking
+/// right after mapping means the file cleans itself up even on SIGKILL.
+pub enum BlobStore {
+    Ram(Vec<u8>),
+    Disk(memmap2::Mmap),
+}
+impl BlobStore {
+    #[inline]
+    pub fn bytes(&self) -> &[u8] {
+        match self { BlobStore::Ram(v) => v, BlobStore::Disk(m) => m }
+    }
+    pub fn len(&self) -> usize { self.bytes().len() }
+}
+
+/// Append-only writer for a blob during the scratch build; `finish()` yields the read view.
+pub enum BlobSink {
+    Ram(Vec<u8>),
+    Disk { w: std::io::BufWriter<std::fs::File>, path: std::path::PathBuf, len: u64 },
+}
+impl BlobSink {
+    /// `spill`: None -> RAM; Some(prefix) -> "{prefix}.{tag}" on disk.
+    pub fn new(spill: Option<&str>, tag: &str) -> Result<BlobSink> {
+        match spill {
+            None => Ok(BlobSink::Ram(Vec::new())),
+            Some(prefix) => {
+                let path = std::path::PathBuf::from(format!("{}.{}", prefix, tag));
+                let f = std::fs::File::create(&path)
+                    .with_context(|| format!("creating scratch spill file {}", path.display()))?;
+                Ok(BlobSink::Disk { w: std::io::BufWriter::with_capacity(1 << 22, f), path, len: 0 })
+            }
+        }
+    }
+    pub fn append(&mut self, b: &[u8]) -> Result<()> {
+        match self {
+            BlobSink::Ram(v) => v.extend_from_slice(b),
+            BlobSink::Disk { w, len, .. } => { std::io::Write::write_all(w, b)?; *len += b.len() as u64; }
+        }
+        Ok(())
+    }
+    pub fn finish(self) -> Result<BlobStore> {
+        match self {
+            BlobSink::Ram(v) => Ok(BlobStore::Ram(v)),
+            BlobSink::Disk { w, path, len } => {
+                let f = w.into_inner().map_err(|e| anyhow::anyhow!("flushing scratch spill: {}", e))?;
+                f.sync_data().ok();
+                drop(f);
+                if len == 0 { let _ = std::fs::remove_file(&path); return Ok(BlobStore::Ram(Vec::new())); }
+                let f = std::fs::File::open(&path)?;
+                let m = unsafe { memmap2::Mmap::map(&f)? };
+                let _ = std::fs::remove_file(&path); // pages stay valid; auto-cleanup on exit
+                Ok(BlobStore::Disk(m))
+            }
+        }
+    }
+}
 
 pub fn shuffle4(src: &[u32]) -> Vec<u8> {
     let n = src.len();
@@ -58,14 +117,15 @@ pub struct Scratch {
     pub chrom_offset: Vec<i64>,
     rowptr: Vec<i64>,
     chunk_row: Vec<i64>,
-    b2_blob: Vec<u8>, b2_off: Vec<i64>,
-    cn_blob: Vec<u8>, cn_off: Vec<i64>,
+    b2_blob: BlobStore, b2_off: Vec<i64>,
+    cn_blob: BlobStore, cn_off: Vec<i64>,
     max_chunk_pix: usize,
     pub nthreads: usize,
 }
 
 impl Scratch {
-    pub fn build(g: &hdf5::Group, chunk_target: usize, nthreads: usize) -> Result<Scratch> {
+    /// `spill`: None -> blobs in RAM; Some(prefix) -> blobs in unlinked mmap'd files "{prefix}.*".
+    pub fn build(g: &hdf5::Group, chunk_target: usize, nthreads: usize, spill: Option<&str>) -> Result<Scratch> {
         let nbins = g.dataset("bins/start")?.shape()[0];
         let nnz = g.dataset("pixels/count")?.shape()[0];
         let mut rowptr: Vec<i64> = g.dataset("indexes/bin1_offset")?.read_1d::<i64>()?.to_vec();
@@ -82,11 +142,13 @@ impl Scratch {
         let nchunks = chunk_row.len() - 1;
         let b2d = g.dataset("pixels/bin2_id")?;
         let cnd = g.dataset("pixels/count")?;
-        let (mut b2_blob, mut cn_blob) = (Vec::new(), Vec::new());
+        let mut b2_blob = BlobSink::new(spill, "b2")?;
+        let mut cn_blob = BlobSink::new(spill, "cn")?;
         let (mut b2_off, mut cn_off) = (vec![0i64], vec![0i64]);
         let max_chunk_pix = (0..nchunks).map(|c| (rowptr[chunk_row[c + 1] as usize] - rowptr[chunk_row[c] as usize]) as usize).max().unwrap_or(1).max(1);
         let pool = rayon::ThreadPoolBuilder::new().num_threads(nthreads).build().unwrap();
-        let read_block = 50_000_000usize; // pixels per HDF5 read batch
+        // spilling implies a tight budget -> smaller read batches (a batch is ~12 B/pixel of heap)
+        let read_block = if spill.is_some() { 20_000_000usize } else { 50_000_000usize };
         let mut c = 0usize;
         while c < nchunks {
             // gather a batch of whole chunks (~read_block pixels), read once, encode in parallel
@@ -120,10 +182,11 @@ impl Scratch {
                 }).collect()
             });
             for (b2c, cnc) in encoded {
-                b2_blob.extend_from_slice(&b2c); b2_off.push(b2_off.last().unwrap() + b2c.len() as i64);
-                cn_blob.extend_from_slice(&cnc); cn_off.push(cn_off.last().unwrap() + cnc.len() as i64);
+                b2_blob.append(&b2c)?; b2_off.push(b2_off.last().unwrap() + b2c.len() as i64);
+                cn_blob.append(&cnc)?; cn_off.push(cn_off.last().unwrap() + cnc.len() as i64);
             }
         }
+        let (b2_blob, cn_blob) = (b2_blob.finish()?, cn_blob.finish()?);
         Ok(Scratch { nbins, nnz, chrom_offset, rowptr, chunk_row, b2_blob, b2_off, cn_blob, cn_off, max_chunk_pix, nthreads })
     }
 
@@ -134,7 +197,7 @@ impl Scratch {
         let p0 = self.rowptr[r0];
         let npix = (self.rowptr[r1] - p0) as usize;
         if npix == 0 { return (r0, r1, 0); }
-        let src = &self.b2_blob[self.b2_off[c] as usize..self.b2_off[c + 1] as usize];
+        let src = &self.b2_blob.bytes()[self.b2_off[c] as usize..self.b2_off[c + 1] as usize];
         let raw = decompress(src, 4 * npix).unwrap();
         sh.clear(); sh.extend_from_slice(&raw);
         unshuffle4(sh, npix, &mut b2[..npix]);
@@ -144,7 +207,7 @@ impl Scratch {
             let mut accv = r as u64;
             for j in s..e { accv += b2[j] as u64; b2[j] = accv as u32; }
         }
-        dec_count(&self.cn_blob[self.cn_off[c] as usize..self.cn_off[c + 1] as usize], npix, &mut cn[..npix]);
+        dec_count(&self.cn_blob.bytes()[self.cn_off[c] as usize..self.cn_off[c + 1] as usize], npix, &mut cn[..npix]);
         (r0, r1, npix)
     }
 

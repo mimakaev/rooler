@@ -98,8 +98,9 @@ rooler expected <cool[::resolutions/R]> [--view chroms|arms|custom:<bed>]
 - **cload** — reads bgzipped `.pairs`, plain text, or `-` for stdin.
 - **merge** — refuses inputs whose bin layouts disagree, rather than producing quiet garbage.
 - **zoomify** — `--balance` balances every resolution as it goes.
-- **balance** — genome-wide iterative correction. `--block` enables a cache-blocked kernel that
-  is worth ~2.8× on very large, fine-resolution coolers (above a few million bins).
+- **balance** — genome-wide iterative correction. The cache-blocked kernel (worth ~2.8× on
+  fine-resolution coolers) engages automatically above 4 M bins; `--block` overrides, `--mem`
+  bounds RAM (scratch spills to a disk-backed mmap beyond it).
 - **expected** — cis distance-decay P(s) per region, stored in the cooler. Views can be
   `chroms`, `arms`, or your own BED; several views coexist in one file.
 
@@ -149,9 +150,12 @@ at billion-pixel scale.
 
 Working: all five ops, the Python read API, assembly enforcement. Known limits:
 
-- **`balance` is memory-bound by design.** It holds a compressed matrix in RAM (~2 bytes per
-  pixel), so a 100-billion-pixel cooler needs far more than a workstation has. Everything else
-  streams. Balancing at that scale is the main open problem.
+- **`balance` respects a `--mem` budget (default 8 GB).** It builds a compressed matrix
+  (~2.5 bytes per pixel) in RAM when it fits, and in a disk-backed memory map next to the
+  cooler when it doesn't — identical results, and committed memory stays small either way
+  (a 2.5-billion-pixel balance peaks at ~2.4 GB of anonymous RSS under an 8 GB budget). Far
+  beyond RAM the cost is re-reading the scratch from NVMe each iteration, so very deep
+  balances become disk-bandwidth-bound rather than impossible.
 - Chromosomes are capped at 2.1 Gb (same limit as cooler).
 - Iterative correction can plateau without converging on very sparse or disconnected matrices;
   it reports `converged=false` rather than pretending.
