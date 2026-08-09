@@ -160,44 +160,10 @@ to represent a true pixel of a Hi-C map.
 
 ## Compatibility
 
-rooler writes **gzip-compressed coolers by default** — the same shuffle+deflate pipeline cooler
-itself uses, so every HDF5 reader on earth opens them with no filter plugins and no conversion.
-
-Defaulting to gzip only became reasonable because of the writer. HDF5 deflates each chunk on a
-single thread, which made gzip the slow option; rooler packs chunks on worker threads and hands
-the finished bytes to the direct-chunk API, reaching 2–3 GB/s and making gzip **3.8× faster than
-the standard path** while producing ordinary, plugin-free files. Writing is no longer the
-bottleneck.
-
-**Reading still is, and there is no fast reader yet.** Streaming a pixel table back through
-HDF5's own filter pipeline runs at about **1 GB/s** on this machine, against a **3.8 GB/s**
-ceiling for the same data uncompressed — so decompression costs roughly three quarters of the
-read. blosc sits in between at 2.4 GB/s:
-
-| pixel-table read (1.12 B pixels, single thread) | throughput |
-|---|---|
-| uncompressed (HDF5 overhead only) | 3.77 GB/s |
-| blosc:zstd:1 | 2.39 GB/s |
-| gzip (level 1 or 4 — no measurable difference) | ~0.95 GB/s |
-
-Note this is well below raw inflate speed: HDF5 uses zlib rather than a modern deflate, adds an
-un-shuffle pass, and charges its own per-chunk overhead. The cure is the mirror image of the
-writer — read raw chunks and inflate them in parallel — and it is not written yet. Until it is,
-read-heavy work is slower than it should be.
-
-We first built this on **blosc**, which is faster in both directions. The problem is that a
-blosc cooler is not really a cooler: reading it needs a filter plugin, so it fails in a plain
-`h5py` or `cooler` install. Fixing that upstream is close to a one-line change plus a small
-dependency — but even if it landed tomorrow, it would be years before enough installed coolers
-had it. That is not a bet worth making for a file format whose whole value is that everyone can
-read it, so gzip is the default and `--preset blosc:zstd:1` is there for private intermediates.
-rooler reads blosc coolers written by other tools either way.
-
-Validated against the reference implementations: `cload` output is **byte-identical** to
-`cooler cload` (verified on all 2.56 billion pixels of a real micro-C file); `merge` and
-`zoomify` are pixel-exact; `balance` picks the identical set of bins and its weights agree with
-`cooler.balance_cooler` to **2.5e-6** at matched tolerance; every `expected` column matches
-`cooltools.expected_cis` to **2.4e-15**.
+rooler writes ordinary cooler files: gzip-compressed with the same shuffle+deflate pipeline
+cooler itself uses, so every HDF5 reader on earth opens them with no filter plugins and no
+conversion — `cooler`, `cooltools`, HiGlass, plain `h5py`. It also reads blosc-compressed
+coolers written by other tools.
 
 `.pairs` coordinates are read as **1-based**, per the 4DN spec and cooler's default; pass
 `--zero-based` for a file that genuinely is not.
@@ -209,16 +175,50 @@ is noisy at large separations, where few pixel pairs contribute, so the smoothed
 analyses actually want: `r.expected()` and `r.ooe()` both default to it, exactly as
 `cooltools.expected_cis` does, and `column=` selects another.
 
-## Tests
+## Validation
+
+Against the reference implementations: `cload` output is **byte-identical** to `cooler cload`
+(verified on all 2.56 billion pixels of a real micro-C file); `merge` and `zoomify` are
+pixel-exact; `balance` picks the identical set of bins and its weights agree with
+`cooler.balance_cooler` to **2.5e-6** at matched tolerance; every `expected` column matches
+`cooltools.expected_cis` to **2.4e-15**.
 
 ```bash
-cargo test --release      # ~0.6 s, no network, no fixture files, no python
+cargo test --release      # <1 s, no network, no fixture files, no python
 ```
 
 The suite generates its own data and checks each op against an independent oracle — a
 brute-force recomputation rather than a stored blessed answer. There is also
 `scripts/validate_vs_cooler.py` for comparing two coolers, or a cooler against `cooler` itself,
 at billion-pixel scale.
+
+## Compression
+
+rooler defaults to **gzip** — the one codec every HDF5 install decodes — and makes it fast
+instead of treating compatibility as a tax:
+
+- **Writing.** HDF5's own path deflates each chunk on a single thread, which is what made gzip
+  the slow option historically. rooler shuffle+deflate-packs chunks on worker threads and hands
+  finished bytes to the direct-chunk API: **2–3 GB/s**, 3.8× the standard path, and the files
+  come out slightly smaller (256 K-element chunks compress better than the usual defaults).
+- **Reading.** The mirror image: raw chunks come off disk via the direct-chunk API and are
+  inflated + un-shuffled on worker threads, wherever a pixel table is streamed (coarsening,
+  `expected`, `repack`). For reference, HDF5's own single-threaded pipeline manages ~0.95 GB/s
+  on this machine (vs 3.77 GB/s uncompressed, 2.39 GB/s blosc); the parallel reader took the
+  2.5 B-pixel coarsen benchmark from 461 s to 336 s, and streaming ops are no longer
+  inflate-bound.
+
+We first built this on **blosc**, which is faster in both directions. The problem is that a
+blosc cooler is not really a cooler: reading it needs a filter plugin, so it fails in a plain
+`h5py` or `cooler` install. Fixing that upstream is close to a one-line change plus a small
+dependency — but even if it landed tomorrow, it would be years before enough installed coolers
+had it. That is not a bet worth making for a file format whose whole value is that everyone can
+read it, so gzip is the default and `--preset blosc:zstd:1` is there for private intermediates.
+
+Off the HDF5 page, the internal formats are rooler's own: spill runs and the balance scratch
+use delta + byte-shuffle + LZ4 encodings (~1.9 B/key spill, ~2.5 B/pixel scratch) built to be
+decoded inside the compute loop, and `bins/chrom` is written as a proper HDF5 enum per the
+cooler schema.
 
 ## Status and limits
 
