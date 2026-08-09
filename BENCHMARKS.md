@@ -150,7 +150,9 @@ Ten ENCODE hg38 micro-C files, `cload` each at 256 bp then `merge`:
 
 ### Synthetic — 100 billion pairs at 64 bp
 
-The point of this run is memory, not speed: it builds a matrix ~30× larger than RAM.
+The point of this run is memory, not speed. The machine has 125 GB of RAM; the finished
+cooler is 176 GB and the full mcool 622 GB, and neither op ever held more than a small
+fraction of that.
 
 | stage | result |
 |---|---|
@@ -160,8 +162,10 @@ The point of this run is memory, not speed: it builds a matrix ~30× larger than
 | `zoomify` | 5 levels (64 → 1024 bp), 622 GB mcool, in 4 h 11 m |
 | — peak RSS | **0.8 GB** |
 
-zoomify's working set is the bin map and a per-bin counter — not the data — which is why a
-622 GB output needs under a gigabyte of memory.
+Read those RSS figures against the outputs. The 176 GB cooler was built in **29.8 GB** — an
+output ~6× the memory that produced it. The 622 GB mcool was built in **0.8 GB**, an output
+~780× the memory that produced it, because zoomify's working set is the fine→coarse bin map
+plus a per-bin counter and never the matrix itself.
 
 Verified afterwards: `nnz` metadata consistent at all five levels; counts conserved **exactly**
 across the whole cascade (484,364,054 over a 247-million-pixel chr1 slice, identical at 64, 128,

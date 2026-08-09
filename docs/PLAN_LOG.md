@@ -186,6 +186,6 @@ costs nearly as much as the last. That is a property of the data, not of the imp
 ### Verdict
 The 64bp claim holds: **100B pairs -> an 81.5B-pixel, 48.3M-bin cooler and a multi-resolution
 mcool (5 levels, 622 GB), entirely out of core, with a 29.8 GB peak for cload (`--mem 32`) and
-0.8 GB for zoomify** — on a machine where the data is ~30x larger than RAM. 300B was not attempted because it needs ~1.18 TB of a 1.20 TB volume —
+0.8 GB for zoomify** — a 176 GB cooler and a 622 GB mcool on a 125 GB machine. 300B was not attempted because it needs ~1.18 TB of a 1.20 TB volume —
 a **disk** limit on this box, not an architectural one; the run is linear in pairs, so 300B
 would take ~3x the time and ~3x the space.

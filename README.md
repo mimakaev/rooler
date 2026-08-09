@@ -38,8 +38,9 @@ rooler's answer is engineering every layer of the pipeline for that scale:
   2D-tiled SpMV keeps the hot vectors cache-resident — worth ~2.8× at 12 M bins.
 
 The largest run so far: **100 billion pairs → an 81-billion-pixel, 48-million-bin cooler at
-64 bp using 30 GB of RAM** — data roughly 30× larger than memory — and the full
-multi-resolution `.mcool` from it in **under a gigabyte**.
+64 bp** — a 176 GB matrix, built in a **29.8 GB peak of RAM**. Cascading that into the full
+multi-resolution `.mcool` produced **622 GB of output using under 1 GB of RAM**, because
+coarsening only ever holds a bin map and a counter, never the matrix.
 
 Speed, measured on the same machine against `cooler` 0.10.4 (details in
 [BENCHMARKS.md](BENCHMARKS.md)):

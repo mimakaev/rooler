@@ -21,7 +21,7 @@ Scale proofs (real data): **megacooler** = 10 ENCODE files (~40B pairs) → 26.3
 cooler @256bp in ~63 min, balanced at 70GB peak RSS.
 
 Scale proof (synthetic, 64bp): **100,000,000,000 pairs → 81,477,686,796 pixels over 48,254,229
-bins at 64 bp** in 1h55m (`--mem 32`), **peak RSS 29.8 GB** — data ~30× larger than RAM. The
+bins at 64 bp** in 1h55m (`--mem 32`), **peak RSS 29.8 GB** for a 176 GB output. The
 mcool cascade (64→128→256→…) then streams at ~8 GB RSS. The 64bp cooler opens in python
 `cooler` and fetches correctly. 300B pairs is a *disk* limit on this box (~1.18 TB of a 1.20 TB
 volume), not an architectural one. See `PLAN_LOG.md`.
