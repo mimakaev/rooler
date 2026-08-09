@@ -16,17 +16,21 @@ enum Cmd {
         #[arg(long, default_value = "4.0")] mem: f64,
         #[arg(long, default_value = "blosc:zstd:1")] preset: String,
         #[arg(long)] assembly: Option<String>,
-        #[arg(long, default_value = "8")] threads: usize,
+        #[arg(long, alias = "nproc", default_value = "8")] threads: usize,
+        /// cooler compatibility: pixels per chunk; maps to --mem when --mem is left at default
+        #[arg(long)] chunksize: Option<u64>,
     },
-    /// Load a .pairs.gz into a .cool at a fixed resolution
+    /// Load a .pairs.gz (or plain .pairs, or "-" for stdin) into a .cool at a fixed resolution
     Cload {
         pairs: String,
         binsize: i64,
         out: String,
         #[arg(long, default_value = "4.0")] mem: f64,
-        #[arg(long, default_value = "8")] threads: usize,
+        #[arg(long, alias = "nproc", default_value = "8")] threads: usize,
         #[arg(long, default_value = "blosc:zstd:1")] preset: String,
         #[arg(long)] assembly: Option<String>,
+        /// cooler compatibility: pixels per chunk; maps to --mem when --mem is left at default
+        #[arg(long)] chunksize: Option<u64>,
     },
     /// Build a multi-resolution .mcool from a base .cool
     Zoomify {
@@ -35,6 +39,9 @@ enum Cmd {
         #[arg(long, value_delimiter=',')] resolutions: Option<Vec<i64>>,
         #[arg(long, default_value = "blosc:zstd:1")] preset: String,
         #[arg(long)] assembly: Option<String>,
+        /// balance every resolution after building (distiller-style)
+        #[arg(long)] balance: bool,
+        #[arg(long, alias = "nproc", default_value = "8")] threads: usize,
     },
     /// Balance a cooler (genome-wide IC); writes bins/weight
     Balance {
@@ -45,7 +52,7 @@ enum Cmd {
         #[arg(long, default_value="0")] min_count: f64,
         #[arg(long, default_value="1e-4")] tol: f64,
         #[arg(long, default_value="200")] max_iters: usize,
-        #[arg(long, default_value="8")] threads: usize,
+        #[arg(long, alias = "nproc", default_value="8")] threads: usize,
         #[arg(long)] block: Option<i64>,
     },
     /// Compute + store cis expected P(s) per region (arms/chroms)
@@ -57,20 +64,36 @@ enum Cmd {
     TestWrite { out: String, #[arg(long, default_value="0")] variant: i32 },
 }
 
+/// cooler-compat shim: `--chunksize C` with `--nproc N` implies roughly C*N*40 bytes of
+/// working set (see MEMORY_CALIBRATION.md). Only applies when --mem was left at its default.
+fn mem_from_chunksize(mem: f64, chunksize: Option<u64>, threads: usize) -> f64 {
+    match chunksize {
+        Some(c) if (mem - 4.0).abs() < f64::EPSILON => {
+            let m = (c as f64 * threads as f64 * 40e-9).max(0.25);
+            eprintln!("  --chunksize {} x --nproc {} -> --mem {:.2} GB", c, threads, m);
+            m
+        }
+        _ => mem,
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Merge { out, inputs, res, mem, preset, assembly, threads } => {
+        Cmd::Merge { out, inputs, res, mem, preset, assembly, threads, chunksize } => {
+            let mem = mem_from_chunksize(mem, chunksize, threads);
             let paths: Vec<String> = inputs.iter().map(|s| s.split("::").next().unwrap().to_string()).collect();
             let r = res.or_else(|| inputs[0].split("::").nth(1).map(|g| g.rsplit('/').next().unwrap().to_string()));
             merge::merge_coolers_parallel(&paths, r.as_deref(), &out, mem, threads, cooler::Comp::parse(&preset)?, assembly.as_deref(), true)?;
         }
-        Cmd::Cload { pairs, binsize, out, mem, threads, preset, assembly } => {
+        Cmd::Cload { pairs, binsize, out, mem, threads, preset, assembly, chunksize } => {
+            let mem = mem_from_chunksize(mem, chunksize, threads);
             let tmp = format!("{}.runs", out);
             cload::cload(&pairs, binsize, &out, mem, threads, cooler::Comp::parse(&preset)?, &tmp, assembly.as_deref(), true)?;
         }
-        Cmd::Zoomify { src, out, resolutions, preset, assembly } => {
-            zoomify::zoomify(&src, &out, resolutions, cooler::Comp::parse(&preset)?, assembly.as_deref(), true)?;
+        Cmd::Zoomify { src, out, resolutions, preset, assembly, balance, threads } => {
+            zoomify::zoomify_and_balance(&src, &out, resolutions, cooler::Comp::parse(&preset)?,
+                assembly.as_deref(), balance, threads, true)?;
         }
         Cmd::Balance { uri, ignore_diags, mad_max, min_nnz, min_count, tol, max_iters, threads, block } => {
             balance::balance(&uri, balance::Params{ignore_diags, mad_max, min_nnz, min_count, tol, max_iters, nthreads: threads, tiled_block: block}, true)?;

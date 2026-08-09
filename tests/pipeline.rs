@@ -250,6 +250,48 @@ fn full_pipeline_matches_oracles() -> Result<()> {
         assert!(f.link_exists(&format!("{}/expected/arms/weight", g_fine)));
     }
 
+    // ---- 6. custom BED view: expected must honour it and store it under its own name ----
+    let bed = d.join("myview.bed");
+    std::fs::write(&bed, format!("chr1\t0\t1000000\tfirstMb\nchr1\t1000000\t2000000\tsecondMb\n"))?;
+    expected::expected(&uri, Some(&format!("custom:{}", bed.display())), false)?;
+    {
+        let f = hdf5::File::open(&mc)?;
+        let ge = f.group(&format!("{}/expected/myview/weight", g_fine))?;
+        let reg = ge.dataset("region_id")?.read_1d::<i32>()?.to_vec();
+        assert_eq!(*reg.iter().max().unwrap(), 1, "custom view should have exactly 2 regions");
+        // each region is 1Mb / 10kb = 100 bins -> 100 distances each
+        assert_eq!(reg.len(), 200, "custom view rows");
+        let gv = f.group(&format!("{}/views/myview", g_fine))?;
+        assert_eq!(gv.dataset("start")?.read_1d::<i64>()?.to_vec(), vec![0, 1_000_000]);
+        assert!(f.link_exists(&format!("{}/expected/chroms/weight", g_fine)), "custom view dropped the others");
+    }
+
+    std::fs::remove_dir_all(d).ok();
+    Ok(())
+}
+
+/// `zoomify --balance` must leave a converged weight vector at every resolution.
+#[test]
+fn zoomify_balance_covers_every_level() -> Result<()> {
+    let case = make_case("zb", 100_000, 4242)?;
+    let d = &case.dir;
+    let p = |n: &str| d.join(n).to_str().unwrap().to_string();
+    let base = p("base.cool");
+    cload::cload(case.pairs.to_str().unwrap(), BINSIZE, &base, 0.01, 4,
+        Comp::parse("blosc:zstd:1")?, &p("runs"), None, false)?;
+    let mc = p("out.mcool");
+    let levels = vec![BINSIZE, BINSIZE * 2, BINSIZE * 4];
+    zoomify::zoomify_and_balance(&base, &mc, Some(levels.clone()), Comp::parse("blosc:zstd:1")?,
+        None, true, 4, false)?;
+    for res in &levels {
+        let g = format!("resolutions/{}", res);
+        let w = read_f64(&mc, &g, "bins/weight")?;
+        assert!(w.iter().any(|x| x.is_finite()), "{}bp has no finite weights", res);
+        let f = hdf5::File::open(&mc)?;
+        let conv = f.group(&g)?.dataset("bins/weight")?.attr("converged")?
+            .read_scalar::<hdf5::types::VarLenAscii>()?;
+        assert_eq!(conv.as_str(), "True", "{}bp did not converge", res);
+    }
     std::fs::remove_dir_all(d).ok();
     Ok(())
 }

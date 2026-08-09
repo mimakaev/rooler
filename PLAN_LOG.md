@@ -86,3 +86,24 @@ is unchanged; and phase B's cost is dominated by the single-thread k-way merge i
   and lo lands on that key — the trailing duplicates in the earlier block are skipped. The
   predicate must be strict (`first_key < lo`). Found by the range-partition unit test before
   it ever ran at scale; it would have silently lost counts.
+
+## Phase 5 — distiller parity + convenience (2026-08-09)
+- `zoomify --balance` balances every level after the cascade. It must run *after* zoomify
+  returns: the builder's HDF5 handles have to be released before balance can reopen the file
+  read-write (same handle-scoping rule as P2). Picks the tiled SpMV automatically above 4M bins.
+- `--nproc` accepted as an alias for `--threads` on cload/merge/balance/zoomify; `--chunksize C`
+  maps to `--mem = C x nproc x 40 B` (MEMORY_CALIBRATION.md) when `--mem` is left at default,
+  and logs the mapping. Verified: `--nproc 4 --chunksize 10000000 -> --mem 1.60 GB`.
+- `--view custom:<bed>`: 3-4 column BED, validated against the cooler (known chrom,
+  0 <= start < end <= length, no overlaps per chrom), named after the file stem so several
+  custom views coexist. Verified end to end (3 regions -> 800 rows, stored under
+  `expected/v` + `views/v` alongside the existing `chroms` view); an overlapping BED errors.
+- Genome table: added name aliases danRer11/GRCz11, rn6, rn7/mRatBN7.2, galGal6/GRCg6a,
+  bosTau9/ARS-UCD1.2, susScr11, canFam4, TAIR10, IRGSP-1.0 -> all default to whole chromosomes.
+  Deliberately NO length fingerprints for these: an unverified fingerprint would mislabel data.
+- Not a regression, noted while testing: balance does not converge on the 5M-pair *subset* at
+  100kb (only 2311/32353 bins survive the mask; the surviving matrix is effectively
+  disconnected, so IC plateaus at cv~2.1). Byte-identical behaviour on the pre-P4 binary, and
+  it correctly reports `converged=false`. Dense/real data converges normally.
+- Tests: 39 (35 unit + 4 integration), including custom-BED parse/validation cases and
+  `zoomify --balance` asserting a converged weight at every level.

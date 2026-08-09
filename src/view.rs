@@ -53,6 +53,17 @@ pub fn detect(assembly: &str, chromsizes: &[(String, i64)]) -> Option<&'static s
         "dm6" | "bdgp6" => Some("dm6"),
         "saccer3" | "r64" => Some("saccer3"),
         "ce11" | "wbcel235" | "ce10" => Some("ce11"),
+        // name aliases only — no length fingerprints for these, since we have not verified
+        // their chromsizes here and a wrong fingerprint would mislabel someone's data
+        "danrer11" | "grcz11" => Some("danrer11"),
+        "rn6" => Some("rn6"),
+        "rn7" | "mratbn7.2" => Some("rn7"),
+        "galgal6" | "grcg6a" => Some("galgal6"),
+        "bostau9" | "ars-ucd1.2" => Some("bostau9"),
+        "susscr11" => Some("susscr11"),
+        "canfam4" => Some("canfam4"),
+        "tair10" => Some("tair10"),
+        "irgsp-1.0" | "os-nipponbare-reference-irgsp-1.0" => Some("irgsp1"),
         _ => None,
     };
     if by_name.is_some() { return by_name; }
@@ -72,6 +83,9 @@ fn default_kind(genome: &str) -> Option<ViewKind> {
     match genome {
         "hg38" | "hg19" | "saccer3" => Some(ViewKind::Arms),
         "mm10" | "mm39" | "dm6" | "ce11" => Some(ViewKind::Chroms),
+        // no centromere tables for these yet -> whole chromosomes
+        "danrer11" | "rn6" | "rn7" | "galgal6" | "bostau9" | "susscr11" | "canfam4"
+        | "tair10" | "irgsp1" => Some(ViewKind::Chroms),
         _ => None,
     }
 }
@@ -100,10 +114,61 @@ fn arms_view(chromsizes: &[(String, i64)], cen: &[(&str, i64)]) -> Vec<Region> {
     out
 }
 
-/// Resolve the region list for expected. `requested`: None=use genome default; Some("chroms"|"arms").
+/// Parse a BED (chrom, start, end[, name]) into regions. Tab- or whitespace-separated;
+/// blank lines and `#`/`track`/`browser` lines ignored. Validated against the cooler's
+/// chromsizes: known chrom, 0 <= start < end <= length, and no overlaps within a chrom.
+pub fn parse_bed(path: &str, chromsizes: &[(String, i64)]) -> Result<Vec<Region>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read view BED {}: {}", path, e))?;
+    let sizes: std::collections::HashMap<&str, i64> =
+        chromsizes.iter().map(|(c, l)| (c.as_str(), *l)).collect();
+    let mut out: Vec<Region> = Vec::new();
+    for (ln, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with("track") || line.starts_with("browser") {
+            continue;
+        }
+        let f: Vec<&str> = line.split_whitespace().collect();
+        let at = |what: &str| format!("{}:{}: {}", path, ln + 1, what);
+        if f.len() < 3 { return Err(at("expected at least 3 columns (chrom start end)")); }
+        let chrom = f[0].to_string();
+        let len = *sizes.get(f[0]).ok_or_else(|| at(&format!("chromosome {:?} is not in the cooler", f[0])))?;
+        let start: i64 = f[1].parse().map_err(|_| at(&format!("bad start {:?}", f[1])))?;
+        let end: i64 = f[2].parse().map_err(|_| at(&format!("bad end {:?}", f[2])))?;
+        if start < 0 || end <= start {
+            return Err(at(&format!("empty or inverted region {}-{}", start, end)));
+        }
+        if end > len {
+            return Err(at(&format!("region ends at {} but {} is {} bp", end, chrom, len)));
+        }
+        let name = f.get(3).map(|s| s.to_string()).unwrap_or_else(|| format!("{}:{}-{}", chrom, start, end));
+        out.push(Region { name, chrom, start, end });
+    }
+    if out.is_empty() { return Err(format!("view BED {} contains no regions", path)); }
+    // overlap check, per chromosome
+    let mut sorted: Vec<&Region> = out.iter().collect();
+    sorted.sort_by(|a, b| a.chrom.cmp(&b.chrom).then(a.start.cmp(&b.start)));
+    for w in sorted.windows(2) {
+        if w[0].chrom == w[1].chrom && w[1].start < w[0].end {
+            return Err(format!("view BED {}: regions {} and {} overlap on {}",
+                path, w[0].name, w[1].name, w[0].chrom));
+        }
+    }
+    Ok(out)
+}
+
+/// Resolve the region list for expected. `requested`: None=use genome default;
+/// Some("chroms"|"arms"|"custom:<bed>").
 /// Returns Err for unknown genome with no explicit request, or "arms" requested without a centromere table.
 pub fn resolve(assembly: &str, chromsizes: &[(String, i64)], requested: Option<&str>)
     -> Result<(String, Vec<Region>), String> {
+    if let Some(spec) = requested.and_then(|r| r.strip_prefix("custom:")) {
+        let regions = parse_bed(spec, chromsizes)?;
+        // name the view after the file stem so several custom views can coexist in one cooler
+        let name = std::path::Path::new(spec).file_stem()
+            .map(|s| s.to_string_lossy().into_owned()).filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "custom".to_string());
+        return Ok((name, regions));
+    }
     let genome = detect(assembly, chromsizes);
     let kind = match requested {
         Some("chroms") => ViewKind::Chroms,
@@ -187,6 +252,63 @@ mod tests {
         let sizes = vec![("chr1".into(), 1000i64)];
         let (_, regs) = resolve("hg38", &sizes, None).unwrap();
         for r in &regs { assert!(r.start <= r.end, "region {} inverted", r.name); }
+    }
+
+    fn write_bed(tag: &str, body: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("rooler_bed_{}_{}", tag, std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join(format!("{}.bed", tag));
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    #[test]
+    fn custom_bed_view_parses_and_names_itself() {
+        let p = write_bed("myregions", "# a comment\ntrack name=x\n\n\
+            chr1\t0\t1000\tleft\nchr1\t2000\t3000\nchr2\t10\t20\tfar\n");
+        let sizes = hg38_sizes();
+        let (name, regs) = resolve("hg38", &sizes, Some(&format!("custom:{}", p.display()))).unwrap();
+        assert_eq!(name, "myregions", "view is named after the BED file stem");
+        assert_eq!(regs.len(), 3);
+        assert_eq!(regs[0].name, "left");
+        assert_eq!((regs[0].chrom.as_str(), regs[0].start, regs[0].end), ("chr1", 0, 1000));
+        assert_eq!(regs[1].name, "chr1:2000-3000", "unnamed regions get a positional name");
+        assert_eq!(regs[2].chrom, "chr2");
+        std::fs::remove_dir_all(p.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn custom_bed_view_rejects_bad_input() {
+        let sizes = hg38_sizes();
+        let cases = [
+            ("unknown_chrom", "chrNOPE\t0\t100\n", "not in the cooler"),
+            ("overlap", "chr1\t0\t1000\nchr1\t500\t1500\n", "overlap"),
+            ("inverted", "chr1\t900\t100\n", "inverted"),
+            ("past_end", "chr1\t0\t999999999999\n", "bp"),
+            ("short", "chr1\t0\n", "3 columns"),
+            ("empty", "# nothing here\n", "no regions"),
+            ("bad_number", "chr1\tzero\t100\n", "bad start"),
+        ];
+        for (tag, body, want) in cases {
+            let p = write_bed(tag, body);
+            let e = resolve("hg38", &sizes, Some(&format!("custom:{}", p.display()))).unwrap_err();
+            assert!(e.contains(want), "case {}: expected error containing {:?}, got {:?}", tag, want, e);
+            std::fs::remove_dir_all(p.parent().unwrap()).ok();
+        }
+        // a missing file must be a clean error, not a panic
+        assert!(resolve("hg38", &sizes, Some("custom:/nonexistent/x.bed")).unwrap_err().contains("cannot read"));
+    }
+
+    #[test]
+    fn added_genome_aliases_resolve_to_chroms() {
+        let sizes = vec![("chrUn".into(), 1000i64)];
+        for a in ["danRer11", "GRCz11", "rn6", "rn7", "mRatBN7.2", "galGal6", "bosTau9",
+                  "susScr11", "canFam4", "TAIR10", "IRGSP-1.0"] {
+            let (name, regs) = resolve(a, &sizes, None)
+                .unwrap_or_else(|e| panic!("{} should resolve: {}", a, e));
+            assert_eq!(name, "chroms", "{} defaults to whole chromosomes", a);
+            assert_eq!(regs.len(), 1);
+        }
     }
 
     #[test]

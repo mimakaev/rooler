@@ -166,7 +166,35 @@ mod tests {
     }
 }
 
-pub fn zoomify(src: &str, out: &str, resolutions: Option<Vec<i64>>, comp: Comp, assembly: Option<&str>, log: bool) -> Result<()> {
+/// Build the mcool, then (optionally) balance every level. Balancing runs *after* the cascade
+/// so the writer's HDF5 handles are all released — an op cannot reopen the file read-write
+/// while any File/Group/Dataset from the build is still alive.
+pub fn zoomify_and_balance(
+    src: &str, out: &str, resolutions: Option<Vec<i64>>, comp: Comp, assembly: Option<&str>,
+    balance: bool, nthreads: usize, log: bool,
+) -> Result<()> {
+    let reslist = zoomify(src, out, resolutions, comp, assembly, log)?;
+    if !balance { return Ok(()); }
+    let t0 = Instant::now();
+    for res in &reslist {
+        let uri = format!("{}::resolutions/{}", out, res);
+        let nbins = {
+            let m = crate::cooler::read_meta(out, Some(&res.to_string()))?;
+            m.nbins
+        };
+        // cache-blocked SpMV pays off once the marginal vectors stop fitting in L3
+        let tiled_block = if nbins >= 4_000_000 { Some(65536) } else { None };
+        if log { eprintln!("  [zoomify] balancing {}bp ({} bins){}", res, nbins,
+            if tiled_block.is_some() { ", tiled" } else { "" }); }
+        crate::balance::balance(&uri, crate::balance::Params {
+            nthreads, tiled_block, ..Default::default() }, log)?;
+    }
+    if log { eprintln!("  zoomify: balanced {} resolutions in {:.0}s", reslist.len(), t0.elapsed().as_secs_f64()); }
+    Ok(())
+}
+
+/// Build the mcool. Returns the resolutions written, coarsest-last.
+pub fn zoomify(src: &str, out: &str, resolutions: Option<Vec<i64>>, comp: Comp, assembly: Option<&str>, log: bool) -> Result<Vec<i64>> {
     let t0 = Instant::now();
     let (names, lengths, base_res, src_asm) = read_root_meta(src)?;
     let chromsizes: Vec<(String, i64)> = names.iter().cloned().zip(lengths.iter().cloned()).collect();
@@ -241,5 +269,5 @@ pub fn zoomify(src: &str, out: &str, resolutions: Option<Vec<i64>>, comp: Comp, 
         prev_res = res;
     }
     if log { eprintln!("  zoomify DONE: {} resolutions in {:.0}s", reslist.len(), t0.elapsed().as_secs_f64()); }
-    Ok(())
+    Ok(reslist)
 }

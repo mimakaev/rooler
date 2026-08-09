@@ -24,20 +24,26 @@ rooler writes blosc:zstd:1 by default (statically linked) and gzip on request.
 
 ## CLI
 ```
-rooler cload   <pairs.gz> <binsize> <out.cool> [--mem 4] [--threads 8] [--preset blosc:zstd:1] [--assembly hg38]
+rooler cload   <pairs[.gz]|-> <binsize> <out.cool> [--mem 4] [--threads 8] [--preset blosc:zstd:1] [--assembly hg38]
 rooler merge   <out.cool> <in1.cool> <in2.cool> ...      [--mem 4] [--res R] [--assembly hg38]
-rooler zoomify <base.cool> <out.mcool> [--resolutions a,b,c] [--assembly hg38]
-rooler balance <cool[::resolutions/R]> [--ignore-diags 2] [--mad-max 5] [--min-nnz 10] [--tol 1e-4] [--threads 8]
-rooler expected <cool[::resolutions/R]> [--view chroms|arms]
+rooler zoomify <base.cool> <out.mcool> [--resolutions a,b,c] [--balance] [--threads 8] [--assembly hg38]
+rooler balance <cool[::resolutions/R]> [--ignore-diags 2] [--mad-max 5] [--min-nnz 10] [--tol 1e-4] [--threads 8] [--block 65536]
+rooler expected <cool[::resolutions/R]> [--view chroms|arms|custom:<bed>]
 ```
+cooler-compat flags: `--nproc` is an alias for `--threads`, and `--chunksize C` maps to a
+`--mem` budget (`C x nproc x 40 B`) when `--mem` is left at its default.
+cload input may be bgzipped (`.gz`, decoded with parallel `bgzip`), plain text, or `-` for stdin.
 - **cload**: bgzip-parallel decode → parse/bin → sort `--mem`-chunks → k-way merge → write. Auto-detects
   and stamps the genome assembly (or `--assembly`); refuses if it can't determine one.
 - **merge**: streaming k-way drain-and-count merge over the (pre-sorted) inputs. No sort, no spill.
-- **zoomify**: streaming integer-factor coarsen (respects chrom boundaries); cascades level to level.
+- **zoomify**: streaming integer-factor coarsen (respects chrom boundaries); cascades level to
+  level. `--balance` then balances every resolution (tiled SpMV automatically above 4M bins).
 - **balance**: genome-wide IC over a compressed CSR scratch (built once, parallel SpMV per iteration).
   Scale-free stop (`CV = std/mean < tol`). Writes cooler-compatible `bins/weight`.
-- **expected**: cis distance-decay P(s) per region (arms/chroms view). One O(nnz) pass for
-  `sum_balanced`, FFT autocorrelation for `n_valid`. Stored in-cooler under `expected/{view}/weight`.
+- **expected**: cis distance-decay P(s) per region. One O(nnz) pass for `sum_balanced`, FFT
+  autocorrelation for `n_valid`. Stored in-cooler under `expected/{view}/weight`; several views
+  can coexist. `--view custom:regions.bed` takes a BED (chrom start end [name]), validated
+  against the cooler's chromsizes and named after the file stem.
 
 ## Python read API (`python/rooler`)
 ```python
