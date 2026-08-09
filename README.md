@@ -1,96 +1,174 @@
 # rooler
 
-A fast, out-of-core, opinionated reimplementation of cooler's heavy CLI path — **cload, merge,
-zoomify, balance, expected** — plus a thin Python read API. Built for genome-wide micro-C scale
-(tens to hundreds of billions of pairs, 64–256 bp resolutions) on commodity RAM.
+**A fast, out-of-core engine for Hi-C / micro-C `.cool` files.**
+`cload` · `merge` · `zoomify` · `balance` · `expected` — plus a small Python read API.
 
-Rust engine (the ops) + a small Python package (the read/analysis API). Output files are valid
-**cooler / mcool** format, so cooler and cooltools work on them natively.
+> **Alpha.** The ops are validated against `cooler`/`cooltools` and have been run on
+> hundred-billion-pair datasets, but this is a young project. Interfaces may still move, and
+> you should spot-check results against `cooler` on your own data before trusting it.
+
+rooler is a reimplementation of the heavy part of the [cooler](https://github.com/open2c/cooler)
+CLI — the distiller-style pipeline `pairs → cload → merge → zoomify → balance` — aimed at the
+scale modern micro-C has reached: **tens to hundreds of billions of contacts, at 64–256 bp
+resolution, on a normal workstation**.
+
+It writes ordinary **cooler files**. `cooler`, `cooltools`, HiGlass and everything else in that
+ecosystem read rooler output directly, with no plugins and no conversion step.
 
 ## Why
-- **Out-of-core everything.** A `--mem` budget bounds RAM; cload/merge scale to any size.
-- **Fast.** Parallel pairs parsing (~95 Mpairs/s), streaming k-way merge, streaming zoomify,
-  compressed-scratch parallel-SpMV balance, and an O(nnz) `expected` (seconds, not hours).
-- **No mystery coolers.** rooler refuses to write a cooler without a genome assembly.
-- **cooler/cooltools compatible.** Files round-trip through `cooler.Cooler`; `cooltools` runs on them.
 
-## Build
-```
-cargo build --release          # needs: rust, libhdf5-dev, liblz4-dev, pkg-config
-# runtime: bgzip (htslib) for cload input
-```
-Reading blosc-compressed coolers written elsewhere: `export HDF5_PLUGIN_PATH=<hdf5plugin>/plugins`.
-rooler writes blosc:zstd:1 by default (statically linked) and gzip on request.
+Deep micro-C broke the assumptions the original tools were built on. A 40-billion-pair dataset
+at 256 bp is not a bigger version of a 2-billion-pair dataset at 5 kb — it stops fitting in
+memory, and the parts of the pipeline that used to be "fast enough" become overnight jobs.
 
-## CLI
-```
-rooler cload   <pairs[.gz]|-> <binsize> <out.cool> [--mem 4] [--threads 8] [--preset blosc:zstd:1] [--assembly hg38]
-rooler merge   <out.cool> <in1.cool> <in2.cool> ...      [--mem 4] [--res R] [--assembly hg38]
-rooler zoomify <base.cool> <out.mcool> [--resolutions a,b,c] [--balance] [--threads 8] [--assembly hg38]
-rooler balance <cool[::resolutions/R]> [--ignore-diags 2] [--mad-max 5] [--min-nnz 10] [--tol 1e-4] [--threads 8] [--block 65536]
-rooler expected <cool[::resolutions/R]> [--view chroms|arms|custom:<bed>]
-```
-cooler-compat flags: `--nproc` is an alias for `--threads`, and `--chunksize C` maps to a
-`--mem` budget (`C x nproc x 40 B`) when `--mem` is left at its default.
-cload input may be bgzipped (`.gz`, decoded with parallel `bgzip`), plain text, or `-` for stdin.
-- **cload**: bgzip-parallel decode → parse/bin → sort `--mem`-chunks → k-way merge → write. Auto-detects
-  and stamps the genome assembly (or `--assembly`); refuses if it can't determine one.
-- **merge**: streaming k-way drain-and-count merge over the (pre-sorted) inputs. No sort, no spill.
-- **zoomify**: streaming integer-factor coarsen (respects chrom boundaries); cascades level to
-  level. `--balance` then balances every resolution (tiled SpMV automatically above 4M bins).
-- **balance**: genome-wide IC over a compressed CSR scratch (built once, parallel SpMV per iteration).
-  Scale-free stop (`CV = std/mean < tol`). Writes cooler-compatible `bins/weight`.
-- **expected**: cis distance-decay P(s) per region. One O(nnz) pass for `sum_balanced`, FFT
-  autocorrelation for `n_valid`. Stored in-cooler under `expected/{view}/weight`; several views
-  can coexist. `--view custom:regions.bed` takes a BED (chrom start end [name]), validated
-  against the cooler's chromsizes and named after the file stem.
+rooler's answer is that **every op streams**. A `--mem` budget bounds RAM; nothing loads a pixel
+table. The largest test so far built an **81-billion-pixel, 48-million-bin cooler at 64 bp
+resolution from 100 billion pairs, using 30 GB of RAM** — data roughly 30× larger than memory —
+and then built the full multi-resolution `.mcool` from it in **under a gigabyte**.
 
-## Python read API (`python/rooler`)
+Speed, measured on the same machine against `cooler` 0.10.4 (details in
+[BENCHMARKS.md](BENCHMARKS.md)):
+
+| op | cooler 0.10.4 | rooler | speedup |
+|---|---|---|---|
+| `cload` — 50 M pairs → 10 kb | 31.4 s | **1.2 s** | **26×** |
+| `balance` — genome-wide IC | 18.7 s | **1.2 s** | **16×** |
+| `balance` — 1.12 B-pixel cooler | 80.6 s | **12.0 s** | **6.7×** |
+| `zoomify` — 5 resolutions | 13.6 s | **3.7 s** | **3.7×** |
+
+Same inputs, same machine, same session, with matching output sizes and matching results.
+
+## Install
+
+```bash
+# engine (needs: rust, libhdf5-dev, pkg-config; bgzip/htslib at runtime for .pairs.gz input)
+cargo install --git https://github.com/mimakaev/rooler
+
+# python read API (optional)
+pip install "git+https://github.com/mimakaev/rooler#subdirectory=python"
+```
+
+## Quickstart
+
+```bash
+# pairs -> cooler at 1 kb
+rooler cload sample.pairs.gz 1000 sample.cool --assembly hg38
+
+# combine replicates
+rooler merge merged.cool rep1.cool rep2.cool rep3.cool
+
+# multi-resolution mcool, balancing every level
+rooler zoomify merged.cool merged.mcool --balance
+
+# or balance one resolution, then compute expected P(s)
+rooler balance merged.mcool::resolutions/1000
+rooler expected merged.mcool::resolutions/1000
+```
+
 ```python
 import rooler
-r = rooler.open("f.mcool", 1000)      # or "f.mcool::resolutions/1000", or "f.cool"
-r.raw("chr1:10_000_000-20_000_000")   # dense raw matrix (symmetric)
-r.balanced("chr1", "chr2")            # balanced (w_i*w_j), trans
-r.raw()[a:b, c:d]                     # bin-index slicing
-r.pixels()[lo:hi]; r.bins()[:]; r.chroms(); r.extent("chr1"); r.info
-r.matrix(balance=True).fetch("chr1")  # cooler-compatible shim
-```
-For cooltools, use `cooler.Cooler(rooler_file)` directly — the files are cooler-format.
+r = rooler.open("merged.mcool", 1000)
 
-## Memory
-`--mem` is the RAM knob; peak RSS ≈ `--mem` + O(nbins) overhead for cload/merge. balance sizes a
-compressed scratch (~2 B/pixel) to the data (no `--mem`). See `MEMORY_CALIBRATION.md`.
+r.raw("chr1:5,000,000-6,000,000")        # dense raw counts
+r.balanced("chr1", "chr2")               # balanced, trans
+r.matrix(balance=True).fetch("chr17")    # cooler-compatible form
+```
+
+Because the output is a real cooler, this also just works:
+
+```python
+import cooler, cooltools
+clr = cooler.Cooler("merged.mcool::resolutions/1000")
+cooltools.expected_cis(clr)
+```
+
+## CLI
+
+```
+rooler cload   <pairs[.gz]|-> <binsize> <out.cool>  [--mem 4] [--threads 8] [--assembly hg38]
+rooler merge   <out.cool> <in1.cool> <in2.cool> ...  [--mem 4] [--res R] [--assembly hg38]
+rooler zoomify <base.cool> <out.mcool>  [--resolutions a,b,c] [--balance] [--threads 8]
+rooler balance <cool[::resolutions/R]>  [--ignore-diags 2] [--mad-max 5] [--min-nnz 10]
+                                        [--tol 1e-4] [--threads 8] [--block 65536]
+rooler expected <cool[::resolutions/R]> [--view chroms|arms|custom:<bed>]
+```
+
+- **cload** — reads bgzipped `.pairs`, plain text, or `-` for stdin.
+- **merge** — refuses inputs whose bin layouts disagree, rather than producing quiet garbage.
+- **zoomify** — `--balance` balances every resolution as it goes.
+- **balance** — genome-wide iterative correction. `--block` enables a cache-blocked kernel that
+  is worth ~2.8× on very large, fine-resolution coolers (above a few million bins).
+- **expected** — cis distance-decay P(s) per region, stored in the cooler. Views can be
+  `chroms`, `arms`, or your own BED; several views coexist in one file.
+
+Coming from cooler: `--nproc` works as an alias for `--threads`, and `--chunksize` maps onto
+the `--mem` budget.
+
+### Two opinionated choices
+
+**No mystery coolers.** rooler refuses to write a cooler without a genome assembly. It will take
+`--assembly`, or infer one from the chromsizes, but it will not silently produce a file whose
+provenance nobody can reconstruct later.
+
+**Counts are `int32`.** Internal accumulators are 64-bit, but stored counts saturate at
+2,147,483,647 with a loud warning telling you how many pixels were affected. Half-width counts
+mean smaller files and better cache behaviour, and a pixel with two billion reads in it is an
+outlier, not a measurement.
+
+## Compatibility
+
+rooler writes **gzip-compressed coolers by default** — the same shuffle+deflate pipeline cooler
+itself uses, so any HDF5 reader opens them with no filter plugins installed. It is also
+substantially faster than the usual gzip path, so compatibility costs you nothing; the pipeline
+is limited by its algorithms, not by the codec. `--preset blosc:zstd:1` is available if you
+prefer, and rooler reads blosc coolers written by other tools.
+
+Validated against the reference implementations: `cload`, `merge` and `zoomify` are
+**pixel-exact**; `balance` picks the identical set of bins and its weights agree with
+`cooler.balance_cooler` to **2.5e-6** at matched tolerance; `expected` matches
+`cooltools.expected_cis` to machine precision (6.4e-16).
 
 ## Tests
-```
-cargo test --release          # ~0.6s, no python / network / fixture files needed
-```
-- **Unit tests** cover the codecs (bin2-delta shuffle+LZ4, u8+exception counts, spill runs),
-  the k-way drain-and-count merge, pairs line parsing, the coarsening bin map, genome views,
-  and the cooler writer (round-trip, index validity, append ordering, preset parsing).
-- **`tests/pipeline.rs`** runs the whole chain — synthetic pairs → cload → merge → zoomify →
-  balance → expected — against independent in-test oracles: a HashMap pixel table for
-  cload/merge/zoomify, a marginal-flatness (CV) property check plus row-vs-tiled agreement for
-  balance, and a brute-force O(n²) recomputation for expected. It also asserts cload is
-  invariant to `--mem`/`--threads`, and that the ops refuse mystery coolers, mismatched merges
-  and unbalanced `expected`.
 
-*Embedding note:* the ops open the file read-write, so drop every HDF5 handle — `Group` and
-`Dataset` too, not just `File` — before calling the next op on the same file in-process.
-
-External cross-check against python cooler (manual, needs h5py/cooler):
-```
-scripts/validate_vs_cooler.py a.cool b.cool [--grp resolutions/1000] [--region chr1:0-5,000,000]
-scripts/validate_vs_cooler.py a.cool --self-check
+```bash
+cargo test --release      # ~0.6 s, no network, no fixture files, no python
 ```
 
-## Validation (vs cooler / cooltools, on real data)
-- cload/merge/zoomify: pixel-exact vs numpy reference / cooler.coarsen_cooler.
-- balance: weights median rel diff **6e-6** vs `cooler.balance_cooler` (0 mask disagreements).
-- expected: `balanced.avg` median rel diff **6e-16** vs `cooltools.expected_cis` (machine precision).
-- Full chain cload→zoomify→balance runs end-to-end; the balanced mcool works in cooler + cooltools.
+The suite generates its own data and checks each op against an independent oracle — a
+brute-force recomputation rather than a stored blessed answer. There is also
+`scripts/validate_vs_cooler.py` for comparing two coolers, or a cooler against `cooler` itself,
+at billion-pixel scale.
 
-## Status
-Working: cload, merge, zoomify, balance, expected, read API, assembly enforcement.
-See `STATUS.md` for the current state + review findings, `PLAN.md` for the roadmap,
-`PROGRESS.md` for the historical build log.
+## Status and limits
+
+Working: all five ops, the Python read API, assembly enforcement. Known limits:
+
+- **`balance` is memory-bound by design.** It holds a compressed matrix in RAM (~2 bytes per
+  pixel), so a 100-billion-pixel cooler needs far more than a workstation has. Everything else
+  streams. Balancing at that scale is the main open problem.
+- Chromosomes are capped at 2.1 Gb (same limit as cooler).
+- Iterative correction can plateau without converging on very sparse or disconnected matrices;
+  it reports `converged=false` rather than pretending.
+
+## Development
+
+`docs/` holds the development record: `STATUS.md` (current state and review findings),
+`PLAN.md` / `PLAN_LOG.md` (the work plan and every measurement taken), `PROGRESS.md` (build
+log), `MEMORY_CALIBRATION.md` (`--mem` sizing data).
+
+## Authorship
+
+**rooler was written entirely by [Claude](https://claude.ai) (Anthropic), in collaboration with
+Max Imakaev.** Every line of Rust and Python in this repository — the engine, the tests, the
+benchmarks and this README — was produced by the model. The human contribution was direction:
+choosing the problem, setting the architecture and the priorities, pushing back on bad ideas,
+and deciding what "correct" and "fast enough" had to mean.
+
+This is stated plainly because it is unusual, and because you should know it when judging the
+code. It is also why the validation is emphasised so heavily: correctness here rests on
+oracle-based tests and agreement with the reference implementations, not on an author's
+authority.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

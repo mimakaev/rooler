@@ -15,7 +15,8 @@ try:
 except Exception:
     pass
 
-__all__ = ["open", "Rooler"]
+__version__ = "0.1.0a1"
+__all__ = ["open", "Rooler", "__version__"]
 
 
 def open(uri, resolution=None):

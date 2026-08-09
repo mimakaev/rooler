@@ -14,7 +14,7 @@ enum Cmd {
         inputs: Vec<String>,
         #[arg(long)] res: Option<String>,
         #[arg(long, default_value = "4.0")] mem: f64,
-        #[arg(long, default_value = "blosc:zstd:1")] preset: String,
+        #[arg(long, default_value = "gzip4")] preset: String,
         #[arg(long)] assembly: Option<String>,
         #[arg(long, alias = "nproc", default_value = "8")] threads: usize,
         /// cooler compatibility: pixels per chunk; maps to --mem when --mem is left at default
@@ -27,7 +27,7 @@ enum Cmd {
         out: String,
         #[arg(long, default_value = "4.0")] mem: f64,
         #[arg(long, alias = "nproc", default_value = "8")] threads: usize,
-        #[arg(long, default_value = "blosc:zstd:1")] preset: String,
+        #[arg(long, default_value = "gzip4")] preset: String,
         #[arg(long)] assembly: Option<String>,
         /// cooler compatibility: pixels per chunk; maps to --mem when --mem is left at default
         #[arg(long)] chunksize: Option<u64>,
@@ -37,7 +37,7 @@ enum Cmd {
         src: String,
         out: String,
         #[arg(long, value_delimiter=',')] resolutions: Option<Vec<i64>>,
-        #[arg(long, default_value = "blosc:zstd:1")] preset: String,
+        #[arg(long, default_value = "gzip4")] preset: String,
         #[arg(long)] assembly: Option<String>,
         /// balance every resolution after building (distiller-style)
         #[arg(long)] balance: bool,

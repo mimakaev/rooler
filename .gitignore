@@ -2,5 +2,11 @@
 *.log
 __pycache__/
 *.pyc
-/*.mcool
+*.egg-info/
+/dist
+/build
+python/build/
 /*.cool
+/*.mcool
+/*.pairs
+/*.pairs.gz

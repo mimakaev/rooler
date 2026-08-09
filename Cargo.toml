@@ -1,8 +1,17 @@
 [package]
 name = "rooler"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 edition = "2021"
-description = "Fast out-of-core cooler engine: cload / merge / balance"
+rust-version = "1.75"
+description = "Fast, out-of-core engine for Hi-C/micro-C cooler files: cload, merge, zoomify, balance, expected"
+authors = ["Max Imakaev <mimakaev@gmail.com>"]
+license = "MIT"
+repository = "https://github.com/mimakaev/rooler"
+homepage = "https://github.com/mimakaev/rooler"
+readme = "README.md"
+keywords = ["hi-c", "genomics", "cooler", "bioinformatics", "sparse-matrix"]
+categories = ["science", "command-line-utilities"]
+exclude = ["docs/*", "scripts/*", "target/*"]
 
 [dependencies]
 hdf5 = { package = "hdf5-metno", version = "0.9", features = ["blosc"] }
