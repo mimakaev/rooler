@@ -5,7 +5,7 @@
     r.balanced("chr1", "chr2")            # balanced (w_i * w_j), trans
     r.ooe("chr1:0-2,000,000")             # observed / expected, cis
     r.expected()                          # P(s) table, smoothed by default
-    r.pixels(), r.bins(), r.chroms(), r.info
+    r.pixels(), r.bins(), r.chroms(), r.info   # pixels/bins are polars; chroms is pandas
     r.matrix(balance=True).fetch("chr1")  # cooler-compatible shim
 
 Keep the handle open and reuse it.
@@ -33,6 +33,10 @@ try:
     import hdf5plugin  # noqa: F401  (registers blosc/zstd/lz4 filters for reading)
 except Exception:
     pass
+try:
+    import polars as pl
+except ImportError:  # pixels()/bins() fall back to pandas
+    pl = None
 
 __version__ = "0.1.0a1"
 __all__ = ["open", "Rooler", "__version__"]
@@ -109,7 +113,9 @@ class Rooler:
         return (self.nbins, self.nbins)
 
     def chroms(self):
-        return pd.DataFrame({"name": self.chromnames, "length": self._clen})
+        """cooler-compatible chromosome table: `r.chroms()[:]`, `[lo:hi]`, `.fetch(name)`.
+        Returns pandas with the same columns and dtypes cooler gives (name, length)."""
+        return _ChromTable(self)
 
     def extent(self, region):
         """(bin0, bin1) for a region — cooltools uses this heavily."""
@@ -118,11 +124,17 @@ class Rooler:
     def offset(self, region):
         return self._region_bins(region)[0]
 
-    def bins(self):
-        return _Table(self, "bins")
+    def bins(self, frame="polars"):
+        """Bin table. `frame="pandas"` gives cooler's exact layout (chrom as a categorical)."""
+        return _Table(self, "bins", frame)
 
-    def pixels(self):
-        return _Table(self, "pixels")
+    def pixels(self, join=False, frame="polars"):
+        """Pixel table, as **polars** by default — it is the bulk table, and polars reads it
+        without pandas' per-column copies. `frame="pandas"` returns cooler's exact layout, and
+        `cooler.Cooler(path).pixels()` works on rooler files unchanged if you want cooler's
+        selector itself. `join=True` expands bin ids to chrom1/start1/end1/chrom2/start2/end2.
+        """
+        return _Table(self, "pixels", frame, join)
 
     def weights(self):
         if self._weight is None:
@@ -183,18 +195,52 @@ class Rooler:
         return (df[cols].sort_values(["region1", "dist"], kind="stable")
                 .reset_index(drop=True))
 
-    def _bins_df(self, lo, hi):
-        d = {"chrom": pd.Categorical.from_codes(self._g["bins/chrom"][lo:hi], self.chromnames),
+    # Column dicts, so bins()/pixels() can hand the same arrays to polars or pandas without
+    # an extra copy. chrom is emitted as plain strings; the pandas path re-categoricalises it
+    # to match cooler, and polars stores strings natively.
+    def _chrom_names_for(self, codes):
+        names = np.asarray(self.chromnames, dtype=object)
+        return names[codes]
+
+    def _bins_cols(self, lo, hi):
+        d = {"chrom": self._chrom_names_for(self._g["bins/chrom"][lo:hi]),
              "start": self._g["bins/start"][lo:hi], "end": self._g["bins/end"][lo:hi]}
         if self._weight is not None:
             d["weight"] = self._weight[lo:hi]
-        return pd.DataFrame(d)
+        return d
 
-    def _pixels_df(self, lo, hi):
-        return pd.DataFrame({"bin1_id": self._b1[lo:hi], "bin2_id": self._b2[lo:hi],
-                             "count": self._cn[lo:hi]})
+    def _pixels_cols(self, lo, hi, join=False):
+        b1, b2 = self._b1[lo:hi], self._b2[lo:hi]
+        cnt = self._cn[lo:hi]
+        if not join:
+            return {"bin1_id": b1, "bin2_id": b2, "count": cnt}
+        # expand bin ids to coordinates, the way cooler's pixels(join=True) does
+        cid = self._g["bins/chrom"]
+        st, en = self._g["bins/start"], self._g["bins/end"]
+        def coords(b):
+            b = np.asarray(b)
+            order = np.argsort(b, kind="stable")          # h5py needs increasing fancy indices
+            uniq, inv = np.unique(b[order], return_inverse=True)
+            c = self._chrom_names_for(cid[uniq])[inv]
+            s, e = st[uniq][inv], en[uniq][inv]
+            back = np.empty_like(order)
+            back[order] = np.arange(len(order))
+            return c[back], s[back], e[back]
+        c1, s1, e1 = coords(b1)
+        c2, s2, e2 = coords(b2)
+        return {"chrom1": c1, "start1": s1, "end1": e1,
+                "chrom2": c2, "start2": s2, "end2": e2, "count": cnt}
 
     # ---- region -> bin range ----
+    def _region_span(self, chrom, start, end):
+        """Bin range of a *view region*, assigning each bin to the region holding most of it
+        (midpoint rule). Must match src/expected.rs, or ooe would divide by the wrong curve."""
+        ci = self._cid[chrom]
+        base = int(self.chrom_offset[ci])
+        cbins = int(self.chrom_offset[ci + 1]) - base
+        mid = lambda x: min(max(int(np.ceil(x / self.binsize - 0.5)), 0), cbins)
+        return base + mid(start), base + mid(end)
+
     def _region_bins(self, region):
         chrom, start, end = _parse_region(region, self.chromsizes)
         base = self.chrom_offset[self._cid[chrom]]
@@ -235,9 +281,7 @@ class Rooler:
         names = [n.decode() if isinstance(n, bytes) else n for n in gv["name"][:]]
         region_of = np.full(self.nbins, -1, dtype=np.int32)
         for rid, (c, s, e) in enumerate(zip(chroms, starts, ends)):
-            base = self.chrom_offset[self._cid[c]]
-            b0 = base + s // self.binsize
-            b1 = base + -(-e // self.binsize)     # ceil
+            b0, b1 = self._region_span(c, s, e)
             region_of[b0:b1] = rid
         by_name = {n: rid for rid, n in enumerate(names)}
         tables = {}
@@ -255,10 +299,7 @@ class Rooler:
             rid = names.index(region)
             c = gv["chrom"][rid]
             c = c.decode() if isinstance(c, bytes) else c
-            base = self.chrom_offset[self._cid[c]]
-            b0 = base + int(gv["start"][rid]) // self.binsize
-            b1 = base + -(-int(gv["end"][rid]) // self.binsize)
-            return int(b0), int(b1)
+            return self._region_span(c, int(gv["start"][rid]), int(gv["end"][rid]))
         return self._region_bins(region)
 
     def _one_region(self, rng, region_of, names, view, what):
@@ -410,36 +451,128 @@ class _MatrixSelector:
         return self.roo._fetch_bins(a0, a1, b0, b1, self.balance, self.sparse)
 
 
+class _ChromTable:
+    """cooler-compatible chromosome table. Small metadata, so it stays pandas and matches
+    cooler's columns and dtypes exactly (name: str, length: int32)."""
+    def __init__(self, roo):
+        self.roo = roo
+
+    def __len__(self):
+        return len(self.roo.chromnames)
+
+    @property
+    def columns(self):
+        return ["name", "length"]
+
+    @property
+    def shape(self):
+        return (len(self), 2)
+
+    def keys(self):
+        return list(self.roo.chromnames)
+
+    def _slice(self, lo, hi):
+        return pd.DataFrame(
+            {"name": pd.array(self.roo.chromnames[lo:hi], dtype="string"),
+             "length": self.roo._clen[lo:hi].astype(np.int32)})
+
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            return self._slice(key.start or 0,
+                               key.stop if key.stop is not None else len(self))
+        if isinstance(key, str):
+            return self._slice(0, len(self))[key]
+        if isinstance(key, (int, np.integer)):
+            return self._slice(key, key + 1)
+        raise TypeError(key)
+
+    def fetch(self, name):
+        """The row for one chromosome. (cooler's chroms().fetch raises NotImplementedError;
+        this is an addition, not a compatibility requirement.)"""
+        if name not in self.roo._cid:
+            raise ValueError(f"no chromosome {name!r}")
+        i = self.roo._cid[name]
+        return self._slice(i, i + 1)
+
+    def __repr__(self):
+        return f"<chroms {len(self)} rows>"
+
+
 class _Table:
-    """cooler-compatible bins()/pixels() selector: [:], [lo:hi], and (bins) .fetch(region)."""
-    def __init__(self, roo, kind):
-        self.roo, self.kind = roo, kind
+    """bins()/pixels() selector: `[:]`, `[lo:hi]`, `['col']`, and `.fetch(region)`.
+
+    Returns polars by default — these are the bulk tables, and a billion-pixel slice should
+    not pay pandas' per-column conversions. Pass frame="pandas" for cooler's exact layout.
+    """
+    def __init__(self, roo, kind, frame="polars", join=False):
+        if frame not in ("polars", "pandas"):
+            raise ValueError(f"frame must be 'polars' or 'pandas', got {frame!r}")
+        if frame == "polars" and pl is None:
+            frame = "pandas"
+        self.roo, self.kind, self.frame, self.join = roo, kind, frame, join
         self._n = roo.nbins if kind == "bins" else roo.nnz
 
     def __len__(self):
         return self._n
 
     @property
+    def shape(self):
+        return (self._n, len(self.columns))
+
+    @property
     def columns(self):
         if self.kind == "bins":
             c = ["chrom", "start", "end"]
             return c + (["weight"] if self.roo._weight is not None else [])
+        if self.join:
+            return ["chrom1", "start1", "end1", "chrom2", "start2", "end2", "count"]
         return ["bin1_id", "bin2_id", "count"]
 
     def _slice(self, lo, hi):
-        return self.roo._bins_df(lo, hi) if self.kind == "bins" else self.roo._pixels_df(lo, hi)
+        lo, hi = max(int(lo), 0), min(int(hi), self._n)
+        if hi < lo:
+            hi = lo
+        d = (self.roo._bins_cols(lo, hi) if self.kind == "bins"
+             else self.roo._pixels_cols(lo, hi, self.join))
+        if self.frame == "polars":
+            return pl.DataFrame(d)
+        df = pd.DataFrame(d)
+        # cooler stores chrom as an *ordered* categorical over the chromosome order
+        if self.kind == "bins":
+            df["chrom"] = pd.Categorical(df["chrom"], categories=self.roo.chromnames, ordered=True)
+        elif self.join:
+            for c in ("chrom1", "chrom2"):
+                df[c] = pd.Categorical(df[c], categories=self.roo.chromnames, ordered=True)
+        return df
 
     def __getitem__(self, key):
         if isinstance(key, slice):
-            lo = key.start or 0
-            hi = key.stop if key.stop is not None else self._n
-            return self._slice(lo, hi)
-        if isinstance(key, str):  # column access: clr.bins()['weight']
+            return self._slice(key.start or 0,
+                               key.stop if key.stop is not None else self._n)
+        if isinstance(key, str):          # column access: r.bins()['weight']
             return self._slice(0, self._n)[key]
+        if isinstance(key, (int, np.integer)):
+            return self._slice(key, key + 1)
         raise TypeError(key)
 
-    def fetch(self, region):
-        if self.kind != "bins":
-            raise NotImplementedError("pixels().fetch not supported; use [lo:hi]")
+    def fetch(self, region, region2=None):
+        """Rows for a region. For pixels this is every stored pixel whose *bin1* lies in the
+        region (the row-block the bin1_offset index addresses), optionally further restricted
+        to pixels whose bin2 lies in `region2`."""
         b0, b1 = self.roo._region_bins(region)
-        return self._slice(b0, b1)
+        if self.kind == "bins":
+            return self._slice(b0, b1)
+        p0, p1 = int(self.roo.bin1_offset[b0]), int(self.roo.bin1_offset[b1])
+        out = self._slice(p0, p1)
+        if region2 is None:
+            return out
+        c0, c1 = self.roo._region_bins(region2)
+        if self.join:
+            raise NotImplementedError("fetch(region, region2) needs join=False")
+        if self.frame == "polars":
+            return out.filter((pl.col("bin2_id") >= c0) & (pl.col("bin2_id") < c1))
+        m = (out["bin2_id"] >= c0) & (out["bin2_id"] < c1)
+        return out[m].reset_index(drop=True)
+
+    def __repr__(self):
+        return f"<{self.kind} {self._n} rows, {self.frame}>"

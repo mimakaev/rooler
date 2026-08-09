@@ -5,7 +5,7 @@
 #   scripts/bench_2p5b.sh <workdir>
 set -u
 W=${1:-/workspace/scratch_bench/b25}
-SRC=${SRC:-/workspace/scratch_bench/plan_base.cool}          # 2,563,532,430 pixels, 12,537,161 bins
+SRC=${SRC:-/workspace/scratch_bench/enc514_256.cool}          # 2,563,532,430 pixels, 12,537,161 bins
 PAIRS=${PAIRS:-/workspace/encode_hic_pairs/ENCFF514KZU.pairs.gz}
 CHROMS=${CHROMS:-/workspace/scratch_bench/bench/chrom.sizes}
 NP=${NP:-8}

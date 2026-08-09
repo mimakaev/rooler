@@ -2,7 +2,7 @@
 //! sum_balanced[region][dist]; n_valid[region][dist] via FFT autocorrelation of the region's
 //! valid-mask. Stored in-cooler under {grp}/expected/{view}/weight (+ the view under {grp}/views/).
 use crate::view;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use hdf5::File;
 use num_complex::Complex;
 use rustfft::FftPlanner;
@@ -123,14 +123,24 @@ pub fn expected(uri: &str, view_req: Option<&str>, log: bool) -> Result<()> {
     let nreg = regions.len();
     let mut reg_b0 = vec![0i64; nreg];
     let mut reg_len = vec![0usize; nreg];
-    let mut region_of = vec![-1i32; nbins];
+    let mut region_of = vec![[-1i32; 2]; nbins];
     for (ri, r) in regions.iter().enumerate() {
         let c = *cid.get(r.chrom.as_str()).ok_or_else(|| anyhow!("region chrom {} not in cooler", r.chrom))?;
         let base = meta.chrom_offset[c];
+        // Extent follows cooler's own floor/ceil rule, so n_valid and the curve length match
+        // cooltools exactly. When a region boundary falls inside a bin the two extents overlap
+        // on that bin, and a bin may therefore belong to TWO adjacent regions -- which is what
+        // cooltools does too, visiting each region independently. Membership is stored as up to
+        // two ids per bin so the single streaming pass can reproduce that.
         let b0 = base + r.start / meta.binsize;
         let b1 = base + (r.end + meta.binsize - 1) / meta.binsize;
         reg_b0[ri] = b0; reg_len[ri] = (b1 - b0) as usize;
-        for b in b0..b1 { region_of[b as usize] = ri as i32; }
+        for b in b0..b1 {
+            let slot = &mut region_of[b as usize];
+            if slot[0] < 0 { slot[0] = ri as i32; }
+            else if slot[1] < 0 { slot[1] = ri as i32; }
+            else { bail!("bin {} falls in more than two regions of view {:?}", b, view_name); }
+        }
     }
 
     // streaming per-region, per-distance sums: balanced (count*w_i*w_j over valid pixels) and raw
@@ -139,15 +149,18 @@ pub fn expected(uri: &str, view_req: Option<&str>, log: bool) -> Result<()> {
     stream_pixels(&g, 1 << 22, |ia, ja, ca| {
         for k in 0..ia.len() {
             let (i, j) = (ia[k] as usize, ja[k] as usize);
-            let ri = region_of[i];
-            if ri < 0 || region_of[j] != ri { continue; }
+            let (ri, rj) = (region_of[i], region_of[j]);
+            if ri[0] < 0 || rj[0] < 0 { continue; }
             // the balancing mask applies to BOTH transforms: cooltools drops pixels touching a
             // masked bin before summing, so count.sum is over valid pixels too, not all pixels
             let (wi, wj) = (weight[i], weight[j]);
             if wi.is_nan() || wj.is_nan() { continue; }
             let d = (ja[k] - ia[k]) as usize;
-            sumc[ri as usize][d] += ca[k] as f64;
-            sumb[ri as usize][d] += ca[k] as f64 * wi * wj;
+            let (c, b) = (ca[k] as f64, ca[k] as f64 * wi * wj);
+            for &a in ri.iter() {
+                if a < 0 { continue; }
+                if rj.contains(&a) { sumc[a as usize][d] += c; sumb[a as usize][d] += b; }
+            }
         }
     })?;
     if log { eprintln!("  expected: sum pass done ({} regions, view={}) {:.0}s", nreg, view_name, t0.elapsed().as_secs_f64()); }

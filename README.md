@@ -92,8 +92,19 @@ with rooler.open("merged.mcool", 1000) as r:
     r.balanced("chr1", "chr2")           # balanced, trans
     r.ooe("chr1_p")                      # observed / expected, cis
     r.expected()                         # P(s) table, smoothed by default
+
+    r.pixels()[:1_000_000]               # polars
+    r.bins().fetch("chr3")               # polars
+    r.chroms()[:]                        # pandas, exactly cooler's table
     r.matrix(balance=True).fetch("chr17")  # cooler-compatible form
 ```
+
+**Tables.** `pixels()` and `bins()` are the bulk tables and return **polars** — a 40 M-pixel
+slice reads in 0.88 s versus 1.12 s into pandas. `chroms()` is small metadata and stays pandas,
+matching cooler's columns and dtypes exactly. Any of them takes `frame="pandas"` to produce
+cooler's exact layout (verified equal to cooler's own accessors, including the ordered
+categorical `chrom` and `pixels(join=True)`), and `cooler.Cooler(path)` works on rooler files
+if you would rather use cooler's selectors directly.
 
 **Keep the handle open.** Unlike Cooler, opening a `Rooler` reads and caches everything a fetch needs — chrom
 names and lengths, chrom offsets, the whole `bin1_offset` index — and lazily caches the
