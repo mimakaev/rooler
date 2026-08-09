@@ -26,7 +26,8 @@ rooler's answer is engineering every layer of the pipeline for that scale:
 - **Truly streaming, explicitly algorithmic ops.** Each operation is implemented as the
   algorithm it claims to be — merge is a k-way merge, coarsen is a streaming accumulation —
   not a chunk-sort in disguise. Rust kernels work in place, without the memcopies that
-  numpy-based chunking cannot avoid. A `--mem` budget bounds RAM; nothing loads a pixel table.
+  numpy-based chunking cannot avoid. Pixels are processed as they stream past, so `--mem` is a
+  real budget rather than a hint, and no op ever holds the matrix.
 - **Compact custom intermediates.** Spill runs and scratch use purpose-built compressed binary
   formats (delta + byte-shuffle + LZ4), ~4× smaller than raw and fast enough to decode inside
   the compute loop.
@@ -37,12 +38,13 @@ rooler's answer is engineering every layer of the pipeline for that scale:
 - **Cache-blocked kernels.** When the bin table outgrows the CPU cache (fine resolutions), a
   2D-tiled SpMV keeps the hot vectors cache-resident — worth ~2.8× at 12 M bins.
 
-The largest run so far: **100 billion pairs → an 81-billion-pixel, 48-million-bin cooler at
-64 bp** — a 176 GB matrix, built in a **29.8 GB peak of RAM**. Cascading that into the full
-multi-resolution `.mcool` produced **622 GB of output using under 1 GB of RAM**, because
-coarsening only ever holds a bin map and a counter, never the matrix.
+The largest run so far took **100 billion pairs to an 81-billion-pixel, 48-million-bin cooler
+at 64 bp in under two hours**, and cascaded it into a five-level 622 GB `.mcool` in another
+four. For reference, that single cooler is roughly thirty times the size of a typical deep
+Hi-C map. It also ran in a **29.8 GB peak of RAM**, and the coarsening cascade in under 1 GB —
+memory is bounded by `--mem`, not by the data.
 
-Speed, measured on the same machine against `cooler` 0.10.4 (details in
+Against `cooler` 0.10.4 on the same machine and inputs (details in
 [BENCHMARKS.md](BENCHMARKS.md)):
 
 | op | cooler 0.10.4 | rooler | speedup |
@@ -51,10 +53,6 @@ Speed, measured on the same machine against `cooler` 0.10.4 (details in
 | `balance` — 2.5 B pixels, 12.5 M bins | 670 s | **51 s** | **13×** |
 | `coarsen` — 2.5 B pixels, 3 levels | 1955 s | **460 s** | **4.3×** |
 | `cload` — 50 M pairs → 10 kb | 31.4 s | **1.2 s** | **26×** |
-
-Same inputs, same machine, same session — and the same answers: `cload` output is
-**byte-identical to cooler's**, coarsened levels match pixel for pixel, and balance selects an
-identical bin mask with weights agreeing to ~1e-5.
 
 ## Install
 
@@ -88,30 +86,19 @@ rooler repack old.mcool --backup --assembly hg38
 
 ```python
 import rooler
-r = rooler.open("merged.mcool", 1000)     # open once, reuse — see below
 
-r.raw("chr1:5,000,000-6,000,000")        # dense raw counts
-r.balanced("chr1", "chr2")               # balanced, trans
-r.ooe("chr1_p")                          # observed / expected, cis
-r.expected()                             # P(s) table, smoothed by default
-r.matrix(balance=True).fetch("chr17")    # cooler-compatible form
+with rooler.open("merged.mcool", 1000) as r:
+    r.raw("chr1:5,000,000-6,000,000")    # dense raw counts
+    r.balanced("chr1", "chr2")           # balanced, trans
+    r.ooe("chr1_p")                      # observed / expected, cis
+    r.expected()                         # P(s) table, smoothed by default
+    r.matrix(balance=True).fetch("chr17")  # cooler-compatible form
 ```
 
 **Keep the handle open.** Opening a `Rooler` reads and caches everything a fetch needs — chrom
 names and lengths, chrom offsets, the whole `bin1_offset` index — and lazily caches the
 balancing weights and the expected table on first use. Re-opening per fetch re-reads all of
 that and discards the caches. Open once, hold it, fetch many times.
-
-The handle is read-only but still a resource: it holds a file descriptor, and while it is alive
-HDF5 will not let anything in the same process reopen that file for **writing** — so an
-in-process `rooler` op on it would fail. `Rooler` is therefore a context manager with a
-`.close()`; use `with` when you're about to write to the same file, or in a long-running
-process opening many coolers:
-
-```python
-with rooler.open("merged.mcool", 1000) as r:
-    oe = r.ooe("chr2_q")
-```
 
 `ooe()` divides balanced counts by the stored expected at each cell's genomic separation. Both
 sides must sit inside one region of the expected view — a fetch crossing an arm or chromosome
@@ -159,29 +146,52 @@ the `--mem` budget.
 ### Opinionated choices
 
 **No mystery coolers.** rooler refuses to write a cooler without a genome assembly. It will take
-`--assembly`, or infer one from the chromsizes, but it will not silently produce a file whose
-provenance nobody can reconstruct later.
+`--assembly`, or infer one from the chromsizes.
 
 **Expected comes built in.** In practice, people compute cis expected with cooltools at default
 parameters over chromosome arms — and wait hours-to-days for what is one O(nnz) pass. rooler
 computes it **by default whenever weights are written** (`balance`, `zoomify --balance`,
 `repack`), with a per-organism default view: arms where arms are meaningful (human, yeast),
-whole chromosomes where they are not (mouse, fly, worm). Unknown genomes get a warning, not a
-failure; `--no-expected` opts out; explicitly requested views (`arms`, `chroms`, custom BEDs)
-coexist in the file.
+whole chromosomes where they are not (mouse, fly, worm).
 
 **Counts are `int32`.** Internal accumulators are 64-bit, but stored counts saturate at
-2,147,483,647 with a loud warning telling you how many pixels were affected. Half-width counts
-mean smaller files and better cache behaviour, and a pixel with two billion reads in it is an
-outlier, not a measurement.
+2,147,483,647 with a loud warning telling you how many pixels were affected — a value unlikely
+to represent a true pixel of a Hi-C map.
 
 ## Compatibility
 
 rooler writes **gzip-compressed coolers by default** — the same shuffle+deflate pipeline cooler
-itself uses, so any HDF5 reader opens them with no filter plugins installed. It is also
-substantially faster than the usual gzip path, so compatibility costs you nothing; the pipeline
-is limited by its algorithms, not by the codec. `--preset blosc:zstd:1` is available if you
-prefer, and rooler reads blosc coolers written by other tools.
+itself uses, so every HDF5 reader on earth opens them with no filter plugins and no conversion.
+
+Defaulting to gzip only became reasonable because of the writer. HDF5 deflates each chunk on a
+single thread, which made gzip the slow option; rooler packs chunks on worker threads and hands
+the finished bytes to the direct-chunk API, reaching 2–3 GB/s and making gzip **3.8× faster than
+the standard path** while producing ordinary, plugin-free files. Writing is no longer the
+bottleneck.
+
+**Reading still is, and there is no fast reader yet.** Streaming a pixel table back through
+HDF5's own filter pipeline runs at about **1 GB/s** on this machine, against a **3.8 GB/s**
+ceiling for the same data uncompressed — so decompression costs roughly three quarters of the
+read. blosc sits in between at 2.4 GB/s:
+
+| pixel-table read (1.12 B pixels, single thread) | throughput |
+|---|---|
+| uncompressed (HDF5 overhead only) | 3.77 GB/s |
+| blosc:zstd:1 | 2.39 GB/s |
+| gzip (level 1 or 4 — no measurable difference) | ~0.95 GB/s |
+
+Note this is well below raw inflate speed: HDF5 uses zlib rather than a modern deflate, adds an
+un-shuffle pass, and charges its own per-chunk overhead. The cure is the mirror image of the
+writer — read raw chunks and inflate them in parallel — and it is not written yet. Until it is,
+read-heavy work is slower than it should be.
+
+We first built this on **blosc**, which is faster in both directions. The problem is that a
+blosc cooler is not really a cooler: reading it needs a filter plugin, so it fails in a plain
+`h5py` or `cooler` install. Fixing that upstream is close to a one-line change plus a small
+dependency — but even if it landed tomorrow, it would be years before enough installed coolers
+had it. That is not a bet worth making for a file format whose whole value is that everyone can
+read it, so gzip is the default and `--preset blosc:zstd:1` is there for private intermediates.
+rooler reads blosc coolers written by other tools either way.
 
 Validated against the reference implementations: `cload` output is **byte-identical** to
 `cooler cload` (verified on all 2.56 billion pixels of a real micro-C file); `merge` and

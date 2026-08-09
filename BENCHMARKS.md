@@ -199,6 +199,29 @@ gzip is now **3.8× faster than the standard gzip path** and produces a slightly
 matches blosc on wall time while being **36% smaller**, and it sits within 8% of the
 uncompressed floor — so the write path is no longer what limits the pipeline.
 
+### Reading is the side that is still slow
+
+The writer is fixed; the reader is not. Streaming the same 1.12 B-pixel table back, single
+threaded, through HDF5's own filter pipeline:
+
+| preset | read | vs uncompressed |
+|---|---|---|
+| none | **3.77 GB/s** (188 Mpix/s) | — (this is HDF5's own overhead floor) |
+| blosc:zstd:1 | 2.39 GB/s (120 Mpix/s) | 1.6× slower |
+| gzip1 | 0.94 GB/s (47 Mpix/s) | 4.0× slower |
+| gzip4 | 0.97 GB/s (49 Mpix/s) | 3.9× slower |
+
+Two things worth noting. **Compression level does not affect read speed** — gzip1 and gzip4 are
+within noise of each other, so the folklore that low levels read faster does not survive HDF5's
+pipeline. And ~0.95 GB/s is far below raw inflate throughput (a modern deflate does 2–3 GB/s per
+core on a buffer): HDF5 uses zlib rather than libdeflate, adds an un-shuffle pass, and charges
+per-chunk overhead — visible as the 3.77 GB/s ceiling even with no codec at all.
+
+Netting the overhead out, the codec+shuffle stage alone runs at roughly 1.3 GB/s. A parallel
+direct-chunk *reader* — the mirror of the writer, `H5Dread_chunk` plus libdeflate on rayon
+threads — should recover most of the gap. It is not implemented, and it is the single biggest
+remaining win for read-heavy work such as coarsening.
+
 That is why rooler defaults to gzip: the files need no filter plugins, every HDF5 reader on
 earth opens them, and compatibility costs nothing. (This is not hypothetical — while preparing
 these benchmarks, `cooler balance` failed outright on a blosc-compressed cooler because the
