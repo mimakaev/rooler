@@ -1,6 +1,6 @@
 //! Cooler v3 schema: streaming writer + pixel reader. Integer counts (i32) for v1.
-use anyhow::Result;
-use hdf5::types::{EnumMember, EnumType, FixedAscii, IntSize, TypeDescriptor};
+use anyhow::{anyhow, bail, Result};
+use hdf5::types::FixedAscii;
 use hdf5::{File, Group};
 use ndarray::{arr1, s, Array1};
 
@@ -13,18 +13,31 @@ pub enum Comp {
     BloscLz4(u8),
 }
 impl Comp {
-    pub fn parse(s: &str) -> Comp {
-        if let Some(l) = s.strip_prefix("gzip") {
-            Comp::Gzip(l.parse().unwrap_or(4))
+    /// "gzip[0-9] | blosc:zstd:N | blosc:lz4:N | none". Unknown presets are an error — a typo
+    /// must never silently fall back to a different codec.
+    pub fn parse(s: &str) -> Result<Comp> {
+        const USAGE: &str = "use gzip[0-9] | blosc:zstd:N | blosc:lz4:N | none";
+        let lvl = |x: &str, max: u8| -> Result<u8> {
+            let v: u8 = x.parse().map_err(|_| anyhow!("bad compression level {:?} ({})", x, USAGE))?;
+            if v > max { bail!("compression level {} out of range 0..={} ({})", v, max, USAGE); }
+            Ok(v)
+        };
+        if s == "none" {
+            Ok(Comp::None)
+        } else if let Some(l) = s.strip_prefix("gzip") {
+            Ok(Comp::Gzip(if l.is_empty() { 4 } else { lvl(l, 9)? }))
         } else if let Some(rest) = s.strip_prefix("blosc:") {
             let mut it = rest.split(':');
-            let cname = it.next().unwrap_or("zstd");
-            let cl = it.next().and_then(|x| x.parse().ok()).unwrap_or(1);
-            match cname { "lz4" => Comp::BloscLz4(cl), _ => Comp::BloscZstd(cl) }
-        } else if s == "none" {
-            Comp::None
+            let cname = it.next().unwrap_or("");
+            let cl = match it.next() { Some(x) => lvl(x, 9)?, None => 1 };
+            if it.next().is_some() { bail!("unknown compression preset {:?} ({})", s, USAGE); }
+            match cname {
+                "lz4" => Ok(Comp::BloscLz4(cl)),
+                "zstd" => Ok(Comp::BloscZstd(cl)),
+                _ => bail!("unknown blosc codec {:?} ({})", cname, USAGE),
+            }
         } else {
-            Comp::BloscZstd(1)
+            bail!("unknown compression preset {:?} ({})", s, USAGE)
         }
     }
 }
@@ -42,13 +55,12 @@ macro_rules! cfg_comp {
     }};
 }
 
-fn chrom_enum(names: &[String]) -> TypeDescriptor {
-    let members = names
-        .iter()
-        .enumerate()
-        .map(|(i, n)| EnumMember { name: n.clone(), value: i as u64 })
-        .collect();
-    TypeDescriptor::Enum(EnumType { size: IntSize::U4, signed: true, members })
+/// Saturating i64 -> i32 count cast; bumps *nclamped when the value doesn't fit.
+/// Counts are stored as i32 by design (bandwidth/cache); a pixel with >2.1e9 reads is an
+/// extreme outlier, so we saturate (never wrap) and report how many pixels were affected.
+#[inline]
+pub fn clamp_count(v: i64, nclamped: &mut u64) -> i32 {
+    if v > i32::MAX as i64 { *nclamped += 1; i32::MAX } else { v as i32 }
 }
 
 /// Metadata needed to construct an output matching a set of inputs.
@@ -201,7 +213,7 @@ impl CoolWriter {
                 ends[b] = std::cmp::min(s0 + binsize, l) as i32;
             }
         }
-        write_chrom_enum(&gb, &cids, names)?;
+        write_chrom_codes(&gb, &cids)?;
         build_i32(&gb, "start", &starts, comp)?;
         build_i32(&gb, "end", &ends, comp)?;
 
@@ -221,7 +233,10 @@ impl CoolWriter {
     pub fn append(&mut self, bin1: &[i64], bin2: &[i64], count: &[i32]) -> Result<()> {
         let n = bin1.len();
         if n == 0 { return Ok(()); }
-        debug_assert!(bin1[0] >= self.last_bin1, "append blocks must be sorted by bin1");
+        // once per multi-million-pixel block: free, and catches a caller that breaks bin1 order
+        if bin1[0] < self.last_bin1 {
+            bail!("append: blocks must be non-decreasing in bin1 ({} after {})", bin1[0], self.last_bin1);
+        }
         self.last_bin1 = bin1[n - 1];
         let (lo, hi) = (self.nnz, self.nnz + n);
         self.d1.resize([hi])?; self.d1.write_slice(&arr1(bin1), s![lo..hi])?;
@@ -248,7 +263,7 @@ impl CoolWriter {
     }
 }
 
-fn write_chrom_enum(g: &Group, cids: &[i32], _names: &[String]) -> Result<()> {
+fn write_chrom_codes(g: &Group, cids: &[i32]) -> Result<()> {
     // v1: plain int32 codes (cooler fetch/region use chrom_offset; enum fidelity is a TODO)
     g.new_dataset::<i32>().shape([cids.len()]).create("chrom")?.write(&arr1(cids))?;
     Ok(())

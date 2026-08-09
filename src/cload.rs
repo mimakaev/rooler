@@ -3,7 +3,7 @@
 //! N worker threads each parse+bin+sort+spill their own runs. Phase B: k-way drain-and-count
 //! merge over all runs (count=1) -> writer. RAM bounded by --mem (N worker buffers of mem/N).
 use crate::cooler::{CoolWriter, Comp};
-use crate::merge::{merge_sources_parallel, BlockSource};
+use crate::merge::{merge_sources_to_writer, BlockSource};
 use anyhow::{anyhow, Result};
 use crossbeam_channel::{bounded, Receiver};
 use lz4_flex::block::{compress, decompress};
@@ -24,10 +24,49 @@ fn unshuffle8(buf: &[u8], n: usize) -> Vec<i64> {
     (0..n).map(|i| { let mut b = [0u8; 8]; for p in 0..8 { b[p] = buf[p * n + i]; } i64::from_le_bytes(b) }).collect()
 }
 
-struct Bins { cmap: HashMap<Vec<u8>, i64>, off_lo: Vec<i64>, nbins: i64, binsize: i64 }
+pub struct Bins { pub cmap: HashMap<Vec<u8>, i64>, pub off_lo: Vec<i64>, pub nbins: i64, pub binsize: i64 }
 
 #[inline]
-fn fast_atoi(b: &[u8]) -> i64 { let mut x = 0i64; for &c in b { x = x * 10 + (c - b'0') as i64; } x }
+pub fn fast_atoi(b: &[u8]) -> i64 { let mut x = 0i64; for &c in b { x = x * 10 + (c - b'0') as i64; } x }
+
+/// Per-thread cache of the last chrom name -> id lookup (pairs files are chrom-clustered).
+/// id -1 = empty cache; an empty name never hits (it can't be a valid cached lookup).
+pub struct ChromCache { c1: Vec<u8>, i1: i64, c2: Vec<u8>, i2: i64 }
+impl Default for ChromCache {
+    fn default() -> Self { ChromCache { c1: Vec::new(), i1: -1, c2: Vec::new(), i2: -1 } }
+}
+
+/// Parse one 4DN .pairs body line -> the sorted-pair key (bin1*nbins + bin2).
+/// Fields (tab-separated): 0=readID 1=chr1 2=pos1 3=chr2 4=pos2 ...
+/// Returns Ok(None) for comment/blank/short lines; Err for a chromosome missing from the header.
+#[inline]
+pub fn parse_line(line: &[u8], bins: &Bins, cache: &mut ChromCache) -> Result<Option<i64>> {
+    if line.is_empty() || line[0] == b'#' { return Ok(None); }
+    // t[1..=4] = positions of tabs 1..4 (after readID, chr1, pos1, chr2)
+    let mut t = [0usize; 5]; let mut nt = 0;
+    for (i, &c) in line.iter().enumerate() {
+        if c == b'\t' { nt += 1; t[nt] = i; if nt == 4 { break; } }
+    }
+    if nt < 4 { return Ok(None); }
+    let c1 = &line[t[1] + 1..t[2]];
+    let p1 = fast_atoi(&line[t[2] + 1..t[3]]);
+    let c2 = &line[t[3] + 1..t[4]];
+    let p2rest = &line[t[4] + 1..];
+    let p2 = fast_atoi(match memchr(b'\t', p2rest) { Some(x) => &p2rest[..x], None => p2rest });
+    let lookup = |c: &[u8]| -> Result<i64> {
+        bins.cmap.get(c).copied().ok_or_else(|| anyhow!(
+            "pairs line references chromosome {:?} not present in the #chromsize header",
+            String::from_utf8_lossy(c)))
+    };
+    let i1 = if cache.i1 >= 0 && c1 == cache.c1.as_slice() { cache.i1 }
+             else { let v = lookup(c1)?; cache.c1 = c1.to_vec(); cache.i1 = v; v };
+    let i2 = if cache.i2 >= 0 && c2 == cache.c2.as_slice() { cache.i2 }
+             else { let v = lookup(c2)?; cache.c2 = c2.to_vec(); cache.i2 = v; v };
+    let b1 = bins.off_lo[i1 as usize] + p1 / bins.binsize;
+    let b2 = bins.off_lo[i2 as usize] + p2 / bins.binsize;
+    let (lo, hi) = if b1 <= b2 { (b1, b2) } else { (b2, b1) };
+    Ok(Some(lo * bins.nbins + hi))
+}
 
 fn worker(rx: Receiver<Vec<u8>>, bins: Arc<Bins>, cap: usize, tmpdir: Arc<String>, wid: usize)
     -> Result<(Vec<String>, u64)> {
@@ -35,8 +74,7 @@ fn worker(rx: Receiver<Vec<u8>>, bins: Arc<Bins>, cap: usize, tmpdir: Arc<String
     let mut paths = Vec::new();
     let mut np = 0u64;
     let mut seq = 0usize;
-    let (mut lc1, mut li1, mut lc2, mut li2): (Vec<u8>, i64, Vec<u8>, i64) = (Vec::new(), -1, Vec::new(), -1);
-    let nb = bins.nbins;
+    let mut cache = ChromCache::default();
     // compressed sorted-key runs: per block, delta + byte-shuffle + LZ4 (less spill IO)
     let spill = |buf: &mut Vec<i64>, seq: &mut usize, paths: &mut Vec<String>| -> Result<()> {
         if buf.is_empty() { return Ok(()); }
@@ -61,27 +99,11 @@ fn worker(rx: Receiver<Vec<u8>>, bins: Arc<Bins>, cap: usize, tmpdir: Arc<String
         while let Some(rel) = memchr(b'\n', &block[start..]) {
             let line = &block[start..start + rel];
             start += rel + 1;
-            if line.is_empty() || line[0] == b'#' { continue; }
-            // fields (tab-separated): 0=readID 1=chr1 2=pos1 3=chr2 4=pos2 ...
-            // t[1..=4] = positions of tabs 1..4 (after readID, chr1, pos1, chr2)
-            let mut t = [0usize; 5]; let mut nt = 0;
-            for (i, &c) in line.iter().enumerate() {
-                if c == b'\t' { nt += 1; t[nt] = i; if nt == 4 { break; } }
+            if let Some(key) = parse_line(line, &bins, &mut cache)? {
+                buf.push(key);
+                np += 1;
+                if buf.len() >= cap { spill(&mut buf, &mut seq, &mut paths)?; }
             }
-            if nt < 4 { continue; }
-            let c1 = &line[t[1] + 1..t[2]];
-            let p1 = fast_atoi(&line[t[2] + 1..t[3]]);
-            let c2 = &line[t[3] + 1..t[4]];
-            let p2rest = &line[t[4] + 1..];
-            let p2 = fast_atoi(match memchr(b'\t', p2rest) { Some(x) => &p2rest[..x], None => p2rest });
-            let i1 = if c1 == lc1.as_slice() { li1 } else { let v = bins.cmap[c1]; lc1 = c1.to_vec(); li1 = v; v };
-            let i2 = if c2 == lc2.as_slice() { li2 } else { let v = bins.cmap[c2]; lc2 = c2.to_vec(); li2 = v; v };
-            let b1 = bins.off_lo[i1 as usize] + p1 / bins.binsize;
-            let b2 = bins.off_lo[i2 as usize] + p2 / bins.binsize;
-            let (lo, hi) = if b1 <= b2 { (b1, b2) } else { (b2, b1) };
-            buf.push(lo * nb + hi);
-            np += 1;
-            if buf.len() >= cap { spill(&mut buf, &mut seq, &mut paths)?; }
         }
     }
     let mut buf = buf; let mut seq = seq; let mut paths2 = paths;
@@ -169,15 +191,14 @@ pub fn cload(pairs: &str, binsize: i64, out: &str, mem_gb: f64, nthreads: usize,
     if log { eprintln!("  phase1: {} pairs -> {} runs, {:.0}s ({:.0} Mpairs/s)",
         npairs, run_paths.len(), t0.elapsed().as_secs_f64(), npairs as f64 / t0.elapsed().as_secs_f64() / 1e6); }
 
-    // --- phase B: ranged-parallel drain-and-count merge ---
+    // --- phase B: single-thread k-way drain-and-count merge over the spilled runs ---
+    // (ranged-parallel phase B is PLAN.md P4; phase-B RAM = #runs x SPILL_BLK decode buffers)
     let mut off = vec![0i64];
     for &l in &lengths { off.push(off.last().unwrap() + (l + binsize - 1) / binsize); }
-    // cap phase-B per-run block so total merge RAM stays well under --mem (phase A already used it)
-    let block = ((mem_gb * 0.4 * 1e9 / (8.0 * run_paths.len().max(1) as f64)) as usize).min(8_000_000).max(1 << 16);
     let mut w = CoolWriter::create(out, &names, &lengths, binsize, nbins as usize, &off, comp, &asm)?;
-    let nnz = merge_sources_parallel(
-        run_paths.iter().map(|p| RunReader::open(p, block)).collect::<Result<Vec<_>>>()?,
-        nbins, nthreads, &mut w)?;
+    let nnz = merge_sources_to_writer(
+        run_paths.iter().map(|p| RunReader::open(p)).collect::<Result<Vec<_>>>()?,
+        nbins, &mut w)?;
     w.close()?;
     for p in &run_paths { let _ = std::fs::remove_file(p); }
     let _ = std::fs::remove_dir(tmpdir);
@@ -188,7 +209,7 @@ pub fn cload(pairs: &str, binsize: i64, out: &str, mem_gb: f64, nthreads: usize,
 /// Reads i64 keys from a spilled run in blocks; yields (keys, counts=1).
 pub struct RunReader { f: BufReader<std::fs::File> }
 impl RunReader {
-    pub fn open(p: &str, _block: usize) -> Result<RunReader> {
+    pub fn open(p: &str) -> Result<RunReader> {
         Ok(RunReader { f: BufReader::new(std::fs::File::open(p)?) })
     }
 }

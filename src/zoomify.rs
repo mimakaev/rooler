@@ -45,11 +45,13 @@ struct RowAgg {
     ob2: Vec<i64>,
     oc: Vec<i32>,
     emit: usize,
+    nclamped: u64,
 }
 impl RowAgg {
     fn new(emit: usize) -> RowAgg {
         RowAgg { cur: -1, b2: Vec::new(), c: Vec::new(),
-                 ob1: Vec::with_capacity(emit), ob2: Vec::with_capacity(emit), oc: Vec::with_capacity(emit), emit }
+                 ob1: Vec::with_capacity(emit), ob2: Vec::with_capacity(emit), oc: Vec::with_capacity(emit),
+                 emit, nclamped: 0 }
     }
     fn push(&mut self, cb1: i64, cb2: i64, cnt: i64, w: &mut CoolWriter) -> Result<()> {
         if cb1 != self.cur {
@@ -69,7 +71,8 @@ impl RowAgg {
             let key = self.b2[idx[k]];
             let mut s = 0i64;
             while k < idx.len() && self.b2[idx[k]] == key { s += self.c[idx[k]]; k += 1; }
-            self.ob1.push(self.cur); self.ob2.push(key); self.oc.push(s as i32);
+            self.ob1.push(self.cur); self.ob2.push(key);
+            self.oc.push(crate::cooler::clamp_count(s, &mut self.nclamped));
         }
         self.b2.clear(); self.c.clear();
         if self.ob1.len() >= self.emit { self.drain(w)?; }
@@ -166,6 +169,10 @@ pub fn zoomify(src: &str, out: &str, resolutions: Option<Vec<i64>>, comp: Comp, 
         agg.finish(&mut w)?;
         let nnz = w.nnz;
         w.close()?;
+        if agg.nclamped > 0 {
+            eprintln!("  [zoomify] WARNING {}bp: {} pixels clamped at i32::MAX (counts are stored as i32)",
+                res, agg.nclamped);
+        }
         if log { eprintln!("  [zoomify] {}bp built ({} bins, {} pix) {:.0}s", res, coarse_n, nnz, t0.elapsed().as_secs_f64()); }
         prev_res = res;
     }

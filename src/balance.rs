@@ -70,7 +70,7 @@ pub fn balance(uri: &str, p: Params, log: bool) -> Result<()> {
     let mut mean = 1.0f64; let mut cv = f64::NAN; let mut converged = false;
     for it in 0..p.max_iters {
         let y = sc.spmv(&bias, p.ignore_diags);
-        let mut marg: Vec<f64> = (0..nbins).map(|i| bias[i] * y[i]).collect();
+        let marg: Vec<f64> = (0..nbins).map(|i| bias[i] * y[i]).collect();
         let nz: Vec<f64> = marg.iter().cloned().filter(|&x| x != 0.0).collect();
         if nz.is_empty() { break; }
         let n = nz.len() as f64;
@@ -78,7 +78,6 @@ pub fn balance(uri: &str, p: Params, log: bool) -> Result<()> {
         let var = nz.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
         cv = var.sqrt() / mean;
         for k in 0..nbins { if marg[k] != 0.0 { bias[k] /= marg[k] / mean; } }
-        let _ = &mut marg;
         if log && (it % 5 == 0 || cv < p.tol) { eprintln!("  ic {:3} cv={:.3e}", it, cv); }
         if cv < p.tol { converged = true; break; }
     }

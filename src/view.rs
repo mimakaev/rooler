@@ -25,6 +25,14 @@ const HG19_CEN: &[(&str, i64)] = &[
     ("chr21",13200000),("chr22",14700000),("chrX",60600000),("chrY",12500000),
 ];
 
+// sacCer3 CEN midpoints (SGD/UCSC, approximate to ~1kb — fine for arm-splitting expected).
+const SACCER3_CEN: &[(&str, i64)] = &[
+    ("chrI",151465),("chrII",238207),("chrIII",114385),("chrIV",449711),
+    ("chrV",151987),("chrVI",148510),("chrVII",496920),("chrVIII",105586),
+    ("chrIX",355629),("chrX",436307),("chrXI",440129),("chrXII",150828),
+    ("chrXIII",268031),("chrXIV",628758),("chrXV",326584),("chrXVI",555957),
+];
+
 /// Resolve the assembly name to stamp into a cooler. Explicit user value wins (any non-empty
 /// string is trusted as provenance); otherwise fingerprint the chromsizes. None => indeterminate,
 /// and callers must REFUSE to write (no mystery coolers).
@@ -69,7 +77,9 @@ fn default_kind(genome: &str) -> Option<ViewKind> {
 }
 
 fn centromeres(genome: &str) -> Option<&'static [(&'static str, i64)]> {
-    match genome { "hg38" => Some(HG38_CEN), "hg19" => Some(HG19_CEN), _ => None }
+    match genome {
+        "hg38" => Some(HG38_CEN), "hg19" => Some(HG19_CEN), "saccer3" => Some(SACCER3_CEN), _ => None,
+    }
 }
 
 fn whole_chroms(chromsizes: &[(String, i64)]) -> Vec<Region> {

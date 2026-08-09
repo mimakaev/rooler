@@ -94,8 +94,8 @@ pub fn expected(uri: &str, view_req: Option<&str>, log: bool) -> Result<()> {
         }
     }
 
-    // store: {grp}/expected/{view}/weight
-    let _ = g.unlink("expected");
+    // store: {grp}/expected/{view}/weight (scoped: recomputing one view must not drop the others)
+    let _ = g.unlink(&format!("expected/{}", view_name));
     let ge = g.create_group(&format!("expected/{}/weight", view_name))?;
     ge.new_dataset::<i32>().shape([o_reg.len()]).create("region_id")?.write(&ndarray::arr1(&o_reg))?;
     ge.new_dataset::<i64>().shape([o_dist.len()]).create("dist")?.write(&ndarray::arr1(&o_dist))?;
