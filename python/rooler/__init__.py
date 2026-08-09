@@ -1,11 +1,30 @@
 """rooler — thin Python read API over rooler/cooler-format .cool/.mcool files.
 
     r = rooler.open("f.mcool", 1000)      # or "f.mcool::resolutions/1000", or "f.cool"
-    r.raw().fetch("chr1")                 # dense raw counts (symmetric)
-    r.balance().fetch("chr1", "chr2")     # balanced (w_i * w_j), trans
-    r.fetch("chr1:0-2,000,000", balance=True)
+    r.raw("chr1")                         # dense raw counts (symmetric)
+    r.balanced("chr1", "chr2")            # balanced (w_i * w_j), trans
+    r.ooe("chr1:0-2,000,000")             # observed / expected, cis
+    r.expected()                          # P(s) table, smoothed by default
     r.pixels(), r.bins(), r.chroms(), r.info
     r.matrix(balance=True).fetch("chr1")  # cooler-compatible shim
+
+Keep the handle open and reuse it.
+    Opening a Rooler reads and caches the things every fetch needs — chromosome names and
+    lengths, the chrom offsets and the full `bin1_offset` index — and it lazily caches the
+    balancing weights and the expected table on first use. Those caches live on the object,
+    so re-opening the file per fetch re-reads all of it and throws the caches away. Open once,
+    hold it, fetch many times.
+
+    The handle is read-only, but it is still a resource worth scoping: it holds an OS file
+    descriptor, and while it is alive HDF5 will not let anything in the same process reopen
+    that file for writing (so a rooler op run in-process would fail). `Rooler` is therefore a
+    context manager, and has `.close()`:
+
+        with rooler.open("f.mcool", 1000) as r:
+            m = r.ooe("chr1")
+
+    Prefer a long-lived handle for a whole analysis; use `with` when you are about to write
+    to the same file, or in a long-running process that opens many coolers.
 """
 import numpy as np
 import pandas as pd
@@ -57,6 +76,27 @@ class Rooler:
         self._cn = self._g["pixels/count"]
         self._weight = self._g["bins/weight"] if "weight" in self._g["bins"] else None
         self._wcache = None  # weights read from disk once, on first balanced fetch
+        self._ecache = {}    # (view, column) -> (bin->region map, per-region expected arrays)
+        self._uri = uri
+
+    # ---- lifetime ----
+    # Read-only, but still worth closing: it holds a file descriptor, and while it is open
+    # HDF5 refuses to reopen the same file for writing in this process.
+    def close(self):
+        if self._f is not None:
+            self._f.close()
+            self._f = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+    def __repr__(self):
+        state = "closed" if self._f is None else f"{self.nbins} bins, {self.nnz} pixels"
+        return f"<Rooler {self._uri!r} binsize={self.binsize} {state}>"
 
     # ---- metadata (cooler-compatible) ----
     @property
@@ -178,6 +218,108 @@ class Rooler:
 
     def matrix(self, balance=False, sparse=False):  # cooler-compatible: .fetch()/[...]
         return _MatrixSelector(self, balance, sparse)
+
+    # ---- observed / expected ----
+    def _expected_lookup(self, view, column):
+        """(bin -> view-region id, {region id: expected-by-distance}, region names).
+        Cached on the handle: built once per (view, column), reused by every ooe() call."""
+        key = (view, column)
+        if key in self._ecache:
+            return self._ecache[key]
+        df = self.expected(view=view, column=column)
+        if view is None:
+            view = self.expected_views()[0]
+        gv = self._g[f"views/{view}"]
+        chroms = [c.decode() if isinstance(c, bytes) else c for c in gv["chrom"][:]]
+        starts, ends = gv["start"][:], gv["end"][:]
+        names = [n.decode() if isinstance(n, bytes) else n for n in gv["name"][:]]
+        region_of = np.full(self.nbins, -1, dtype=np.int32)
+        for rid, (c, s, e) in enumerate(zip(chroms, starts, ends)):
+            base = self.chrom_offset[self._cid[c]]
+            b0 = base + s // self.binsize
+            b1 = base + -(-e // self.binsize)     # ceil
+            region_of[b0:b1] = rid
+        by_name = {n: rid for rid, n in enumerate(names)}
+        tables = {}
+        for name, sub in df.groupby("region1", sort=False):
+            tables[by_name[name]] = sub.sort_values("dist")["contact_frequency"].to_numpy()
+        self._ecache[key] = (region_of, tables, names)
+        return self._ecache[key]
+
+    def _one_region(self, rng, region_of, names, view, what):
+        """The bin range must lie inside exactly one view region; otherwise explain why not."""
+        lo, hi = rng
+        r = region_of[lo:hi]
+        if len(r) == 0:
+            raise ValueError(f"{what} is empty")
+        if (r < 0).any():
+            raise ValueError(
+                f"{what} includes bins outside view {view!r} — expected is only defined "
+                f"inside its regions")
+        first = int(r[0])
+        if not (r == first).all():
+            spanned = [names[i] for i in dict.fromkeys(r.tolist())]
+            raise ValueError(
+                f"{what} spans {len(spanned)} regions of view {view!r} ({', '.join(spanned)}). "
+                f"Expected is defined per region, so a fetch crossing that boundary has no "
+                f"single P(s) to divide by — fetch each region separately, or store expected "
+                f"with a coarser view (e.g. `rooler expected --view chroms`).")
+        return first
+
+    def ooe(self, region1=None, region2=None, view=None, column=None):
+        """Observed-over-expected: balanced counts divided by the stored cis expected.
+
+        Each cell (i, j) is divided by the expected value for its genomic separation |i-j|.
+        Both sides must lie inside a single region of the expected view; a fetch that crosses
+        an arm or chromosome boundary — or a trans fetch — **raises**, because there is no one
+        P(s) curve that applies to it. Fetch the regions separately, or store expected with a
+        coarser view.
+
+        Uses the same default column as `expected()`: the log-smoothed, genome-wide aggregated
+        curve (`balanced.avg.smoothed.agg`). Pass `column="balanced.avg.smoothed"` for the
+        per-region curve, or `"balanced.avg"` for the unsmoothed one. Note that OOE only
+        averages to ~1 over the *same* extent the expected was computed for — a sub-region of
+        an arm is generally off by whatever makes it differ from its arm, which is usually the
+        signal you are looking for.
+
+        Requires `rooler expected` to have been run (balance does it by default).
+        """
+        if region1 is None:
+            raise ValueError("ooe() needs a region, e.g. r.ooe('chr1:0-5,000,000')")
+        vname = view if view is not None else (self.expected_views() or [None])[0]
+        region_of, tables, names = self._expected_lookup(view, column)
+        a0, a1 = self._region_bins(region1)
+        b0, b1 = (a0, a1) if region2 is None else self._region_bins(region2)
+        ra = self._one_region((a0, a1), region_of, names, vname, f"region1 {region1!r}")
+        rb = ra if region2 is None else self._one_region(
+            (b0, b1), region_of, names, vname, f"region2 {region2!r}")
+        if ra != rb:
+            raise ValueError(
+                f"observed/expected needs both sides in the same region of view {vname!r}; "
+                f"got {names[ra]!r} and {names[rb]!r}. There is no cis expected across "
+                f"regions (trans expected is a different quantity rooler does not store yet).")
+        curve = tables.get(ra)
+        if curve is None:
+            raise ValueError(f"no expected curve stored for region {names[ra]!r}")
+
+        obs = self._fetch_region(region1, region2, balance=True, sparse=False)
+        # The expected matrix is Toeplitz (exp[i,j] = curve[|i-j|]), so build it as a zero-copy
+        # strided view over a 1-D array of length na+nb-1 rather than materializing na*nb
+        # values. ooe() then costs one divide pass over the observed matrix.
+        na, nb = a1 - a0, b1 - b0
+        d = np.abs(np.arange(a0 - b1 + 1, a1 - b0))
+        ext = np.full(d.shape, np.nan)
+        ok = d < len(curve)
+        ext[ok] = curve[d[ok]]
+        exp = np.lib.stride_tricks.as_strided(
+            ext[nb - 1:], shape=(na, nb),
+            strides=(ext.strides[0], -ext.strides[0]), writeable=False)
+        # obs is freshly allocated by the fetch, so divide in place: saves an allocation and
+        # a full pass over the matrix (~a third of ooe's cost on large fetches)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            np.divide(obs, exp, out=obs)
+        return obs
+
 
     def _fetch_region(self, region1, region2, balance, sparse):
         a0, a1 = self._region_bins(region1)
