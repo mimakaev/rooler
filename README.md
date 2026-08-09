@@ -17,15 +17,16 @@ no plugins and no conversion step.
 
 ## Why
 
-Deep micro-C broke the assumptions the original tools were built on. A 40-billion-pair dataset
-at 256 bp is not a bigger version of a 2-billion-pair dataset at 5 kb — it stops fitting in
-memory, and the parts of the pipeline that used to be "fast enough" become overnight jobs.
+Deep micro-C depth scaled faster than the processing capabilities did. A 40-billion-pair dataset
+at 256 bp is not a bigger version of a 2-billion-pair dataset at 5 kb — bintable does not fit in
+the L3 cache anymore, cooler is bigger than RAM -> OS cashing no longer helps, HDF5's gzip
+decompression bottlenecks everything. Suddenly, cload/merge/zoomify all become overnight jobs. 
 
 rooler's answer is engineering every layer of the pipeline for that scale:
 
 - **Truly streaming, explicitly algorithmic ops.** Each operation is implemented as the
   algorithm it claims to be — merge is a k-way merge, coarsen is a streaming accumulation —
-  not a chunk-sort in disguise. Rust kernels work in place, without the memcopies that
+  not a chunked dataframe groupby-agg. Rust kernels work in place, without the memcopies that
   numpy-based chunking cannot avoid. Pixels are processed as they stream past. `--mem` options
   controls total memory budget for buffers, chunks, etc.
 - **Compact custom intermediates.** Spill runs and scratch use purpose-built compressed binary
@@ -36,7 +37,7 @@ rooler's answer is engineering every layer of the pipeline for that scale:
 - **A parallel gzip writer.** Each HDF5 chunk is shuffle+deflate-packed by hand on worker
   threads and handed to the direct-chunk API: 2–3 GB/s of standard, plugin-free gzip output.
 - **Cache-blocked kernels.** When the bin table outgrows the CPU cache (fine resolutions), a
-  2D-tiled SpMV keeps the hot vectors cache-resident — worth ~2.8× at 12 M bins.
+  2D-tiled SpMV keeps the hot vectors cache-resident during balance — worth ~2.8× at 12 M bins.
 
 The largest run so far took **100 billion pairs to an 81-billion-pixel, 48-million-bin cooler
 at 64 bp in under two hours**, and cascaded it into a five-level 622 GB `.mcool` in another
