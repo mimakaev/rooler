@@ -63,6 +63,38 @@ pub fn clamp_count(v: i64, nclamped: &mut u64) -> i32 {
     if v > i32::MAX as i64 { *nclamped += 1; i32::MAX } else { v as i32 }
 }
 
+/// Bin-pair keys are `bin1*nbins + bin2` in i64; past ~3.04e9 bins (a ~1bp genome-wide binsize)
+/// that multiplication overflows silently. Refuse up front instead.
+pub fn check_key_space(nbins: i64) -> Result<()> {
+    const MAX_NBINS: i64 = 3_037_000_499; // floor(sqrt(i64::MAX))
+    if nbins > MAX_NBINS {
+        bail!("{} bins: bin-pair keys (bin1*nbins+bin2) would overflow i64; \
+               the maximum supported bin count is {} (use a coarser binsize)", nbins, MAX_NBINS);
+    }
+    Ok(())
+}
+
+/// Deletes `path` on drop unless defused — armed right after an output file is created so a
+/// failed op never leaves a valid-looking but incomplete cooler behind, and never touches a
+/// pre-existing file the op hadn't started writing.
+pub(crate) struct PartialFileGuard<'a> {
+    path: &'a str,
+    armed: bool,
+}
+impl<'a> PartialFileGuard<'a> {
+    pub(crate) fn new(path: &'a str) -> Self { PartialFileGuard { path, armed: false } }
+    pub(crate) fn arm(&mut self) { self.armed = true; }
+    pub(crate) fn defuse(&mut self) { self.armed = false; }
+}
+impl Drop for PartialFileGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            eprintln!("  removing incomplete output {}", self.path);
+            let _ = std::fs::remove_file(self.path);
+        }
+    }
+}
+
 /// Metadata needed to construct an output matching a set of inputs.
 pub struct Meta {
     pub names: Vec<String>,
@@ -180,6 +212,15 @@ impl CoolWriter {
         file: &File, group: &str, names: &[String], lengths: &[i64], binsize: i64,
         nbins: usize, chrom_offset: &[i64], comp: Comp, assembly: &str,
     ) -> Result<CoolWriter> {
+        // chrom lengths and bin coordinates are stored int32 (cooler schema); refuse loudly
+        // instead of silently wrapping to negative coordinates (lungfish-class chromosomes)
+        for (n, &l) in names.iter().zip(lengths) {
+            if l > i32::MAX as i64 {
+                bail!("chromosome {:?} is {} bp; the cooler format stores coordinates as int32 (max {})",
+                      n, l, i32::MAX);
+            }
+            if l < 0 { bail!("chromosome {:?} has negative length {}", n, l); }
+        }
         let g = if group == "/" { file.group("/")? } else { file.create_group(group)? };
         let sattr = |name: &str, val: &str| -> Result<()> {
             g.new_attr::<hdf5::types::VarLenAscii>().create(name)?
@@ -218,7 +259,7 @@ impl CoolWriter {
                 ends[b] = std::cmp::min(s0 + binsize, l) as i32;
             }
         }
-        write_chrom_codes(&gb, &cids)?;
+        write_chrom_codes(&gb, &cids, names, comp)?;
         build_i32(&gb, "start", &starts, comp)?;
         build_i32(&gb, "end", &ends, comp)?;
 
@@ -231,9 +272,9 @@ impl CoolWriter {
                 use crate::parwrite::ParColumn;
                 let chunk = 1usize << 18;
                 PixSink::Par {
-                    c1: ParColumn::new(res_i64(&gp, "bin1_id", chunk, comp)?, 8, chunk, level),
-                    c2: ParColumn::new(res_i64(&gp, "bin2_id", chunk, comp)?, 8, chunk, level),
-                    cc: ParColumn::new(res_i32(&gp, "count", chunk, comp)?, 4, chunk, level),
+                    c1: ParColumn::new(res_i64(&gp, "bin1_id", chunk, comp)?, 8, chunk, level)?,
+                    c2: ParColumn::new(res_i64(&gp, "bin2_id", chunk, comp)?, 8, chunk, level)?,
+                    cc: ParColumn::new(res_i32(&gp, "count", chunk, comp)?, 4, chunk, level)?,
                 }
             }
             _ => {
@@ -327,6 +368,23 @@ mod tests {
     }
 
     #[test]
+    fn create_rejects_oversize_chromosomes_and_names() {
+        let d = tmpdir("guards");
+        let p = d.join("t.cool");
+        let ps = p.to_str().unwrap();
+        let err_of = |r: Result<CoolWriter>| match r { Err(e) => e, Ok(_) => panic!("expected an error") };
+        // > 2^31-1 bp cannot be stored in the schema's int32 coordinates -> refuse, don't wrap
+        let e = err_of(CoolWriter::create(ps, &["chrBig".to_string()], &[3_000_000_000], 1_000_000,
+            3_000, &[0, 3_000], Comp::None, "t"));
+        assert!(e.to_string().contains("int32"), "unexpected error: {}", e);
+        // names longer than 64 bytes are refused with the name in the message, not panicked on
+        let long = "x".repeat(65);
+        let e = err_of(CoolWriter::create(ps, &[long], &[100], 10, 10, &[0, 10], Comp::None, "t"));
+        assert!(e.to_string().contains("64"), "unexpected error: {}", e);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
     fn append_rejects_out_of_order_blocks() {
         let d = tmpdir("append");
         let p = d.join("t.cool");
@@ -372,21 +430,93 @@ mod tests {
         assert_eq!(g.dataset("bins/start").unwrap().read_1d::<i32>().unwrap().to_vec(), vec![0, 10, 20, 30, 0, 10]);
         assert_eq!(g.dataset("bins/end").unwrap().read_1d::<i32>().unwrap().to_vec(), vec![10, 20, 30, 35, 10, 20]);
         assert_eq!(g.dataset("bins/chrom").unwrap().read_1d::<i32>().unwrap().to_vec(), vec![0, 0, 0, 0, 1, 1]);
+        // bins/chrom must be a real HDF5 ENUM of the chrom names (the cooler schema type)
+        match g.dataset("bins/chrom").unwrap().dtype().unwrap().to_descriptor().unwrap() {
+            hdf5::types::TypeDescriptor::Enum(e) => {
+                let names: Vec<&str> = e.members.iter().map(|m| m.name.as_str()).collect();
+                assert_eq!(names, vec!["chrA", "chrB"]);
+                assert_eq!(e.members[1].value, 1);
+            }
+            other => panic!("bins/chrom is not an enum: {:?}", other),
+        }
         assert_eq!(g.attr("nnz").unwrap().read_scalar::<i64>().unwrap(), 4);
         drop(f);
         std::fs::remove_dir_all(&d).ok();
     }
 }
 
-fn write_chrom_codes(g: &Group, cids: &[i32]) -> Result<()> {
-    // v1: plain int32 codes (cooler fetch/region use chrom_offset; enum fidelity is a TODO)
-    g.new_dataset::<i32>().shape([cids.len()]).create("chrom")?.write(&arr1(cids))?;
-    Ok(())
+/// `bins/chrom` as a real HDF5 ENUM of the chromosome names over int32 codes — the cooler
+/// schema type (h5py's enum_dtype). The crate can't build runtime enums, so this is raw FFI;
+/// every call runs on this thread under the crate's global lock. Values are identical to the
+/// plain int32 codes we wrote before — only the type gains the name mapping.
+fn write_chrom_codes(g: &Group, cids: &[i32], names: &[String], comp: Comp) -> Result<()> {
+    use hdf5_metno_sys::h5d::{H5Dclose, H5Dcreate2, H5Dwrite};
+    use hdf5_metno_sys::h5i::hid_t;
+    use hdf5_metno_sys::h5p::{H5P_DEFAULT, H5Pclose, H5Pcreate, H5Pset_chunk, H5Pset_deflate,
+                              H5Pset_shuffle, H5P_CLS_DATASET_CREATE};
+    use hdf5_metno_sys::h5s::{H5S_ALL, H5Sclose, H5Screate_simple};
+    use hdf5_metno_sys::h5t::{H5T_NATIVE_INT32, H5Tclose, H5Tenum_create, H5Tenum_insert};
+    let cname = std::ffi::CString::new("chrom")?;
+    let n = cids.len();
+    hdf5::sync::sync(|| -> Result<()> {
+        unsafe {
+            let tid = H5Tenum_create(*H5T_NATIVE_INT32);
+            if tid < 0 { bail!("H5Tenum_create failed"); }
+            // close ids on every exit path
+            let fin = |tid: hid_t, sid: hid_t, dcpl: hid_t, did: hid_t| {
+                if did >= 0 { H5Dclose(did); }
+                if dcpl >= 0 { H5Pclose(dcpl); }
+                if sid >= 0 { H5Sclose(sid); }
+                H5Tclose(tid);
+            };
+            for (i, nm) in names.iter().enumerate() {
+                let c = std::ffi::CString::new(nm.as_str())?;
+                let v: i32 = i as i32;
+                if H5Tenum_insert(tid, c.as_ptr(), (&v as *const i32).cast()) < 0 {
+                    fin(tid, -1, -1, -1);
+                    bail!("H5Tenum_insert failed for chromosome {:?}", nm);
+                }
+            }
+            let dims = [n as u64];
+            let sid = H5Screate_simple(1, dims.as_ptr(), std::ptr::null());
+            if sid < 0 { fin(tid, -1, -1, -1); bail!("H5Screate_simple failed"); }
+            // small dataset: shuffle+deflate for any compressed preset (plain HDF5, no plugins)
+            let dcpl = match comp {
+                Comp::None => H5P_DEFAULT,
+                _ => {
+                    let p = H5Pcreate(*H5P_CLS_DATASET_CREATE);
+                    let chunk = [n.min(1 << 20) as u64];
+                    if p < 0 || H5Pset_chunk(p, 1, chunk.as_ptr()) < 0
+                        || H5Pset_shuffle(p) < 0 || H5Pset_deflate(p, 4) < 0 {
+                        fin(tid, sid, p, -1);
+                        bail!("dcpl setup failed for bins/chrom");
+                    }
+                    p
+                }
+            };
+            let did = H5Dcreate2(g.id() as hid_t, cname.as_ptr(), tid, sid,
+                                 H5P_DEFAULT, dcpl, H5P_DEFAULT);
+            if did < 0 { fin(tid, sid, dcpl, -1); bail!("H5Dcreate2 failed for bins/chrom"); }
+            let rc = if n > 0 {
+                H5Dwrite(did, tid, H5S_ALL, H5S_ALL, H5P_DEFAULT, cids.as_ptr().cast())
+            } else { 0 };
+            fin(tid, sid, if dcpl == H5P_DEFAULT { -1 } else { dcpl }, did);
+            if rc < 0 { bail!("H5Dwrite failed for bins/chrom"); }
+            Ok(())
+        }
+    })
 }
 
 fn write_fixed_ascii(g: &Group, name: &str, vals: &[String], maxlen: usize) -> Result<()> {
+    if maxlen > 64 {
+        let long = vals.iter().max_by_key(|s| s.len()).map(|s| s.as_str()).unwrap_or("");
+        bail!("chromosome name {:?} is {} bytes; at most 64 supported", long, long.len());
+    }
     macro_rules! w { ($n:expr) => {{
-        let a: Vec<FixedAscii<$n>> = vals.iter().map(|s| FixedAscii::<$n>::from_ascii(s.as_bytes()).unwrap()).collect();
+        let a: Vec<FixedAscii<$n>> = vals.iter()
+            .map(|s| FixedAscii::<$n>::from_ascii(s.as_bytes())
+                .map_err(|e| anyhow!("chromosome name {:?} is not ASCII: {}", s, e)))
+            .collect::<Result<_>>()?;
         g.new_dataset::<FixedAscii<$n>>().shape([vals.len()]).create(name)?.write(&arr1(&a))?;
     }}}
     // round maxlen up to a supported const size

@@ -56,6 +56,7 @@ class Rooler:
         self._b2 = self._g["pixels/bin2_id"]
         self._cn = self._g["pixels/count"]
         self._weight = self._g["bins/weight"] if "weight" in self._g["bins"] else None
+        self._wcache = None  # weights read from disk once, on first balanced fetch
 
     # ---- metadata (cooler-compatible) ----
     @property
@@ -84,7 +85,11 @@ class Rooler:
         return _Table(self, "pixels")
 
     def weights(self):
-        return None if self._weight is None else self._weight[:]
+        if self._weight is None:
+            return None
+        if self._wcache is None:
+            self._wcache = self._weight[:]
+        return self._wcache
 
     def _bins_df(self, lo, hi):
         d = {"chrom": pd.Categorical.from_codes(self._g["bins/chrom"][lo:hi], self.chromnames),
@@ -142,8 +147,13 @@ class Rooler:
         i, j, c = self._read_rows(a0, a1)
         m = (j >= b0) & (j < b1)
         np.add.at(M, (i[m] - a0, j[m] - b0), c[m])
-        # transpose (symmetric-upper): stored pixels with bin1 in b-range, col in a-range
-        i2, j2, c2 = self._read_rows(b0, b1)
+        # transpose (symmetric-upper): stored pixels with bin1 in b-range, col in a-range.
+        # A cis square fetch (the common case) has identical ranges — reuse the rows already
+        # read instead of hitting HDF5 a second time.
+        if (b0, b1) == (a0, a1):
+            i2, j2, c2 = i, j, c
+        else:
+            i2, j2, c2 = self._read_rows(b0, b1)
         m2 = (j2 >= a0) & (j2 < a1)
         np.add.at(M, (j2[m2] - a0, i2[m2] - b0), c2[m2])
         # the diagonal (p==q, p in a & b range) is the only cell hit by both passes -> subtract once

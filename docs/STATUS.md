@@ -28,7 +28,7 @@ volume), not an architectural one. See `PLAN_LOG.md`.
 "No mystery coolers" (assembly required) enforced everywhere.
 
 ## Tests
-`cargo test --release` — **39 tests, ~0.6s**, no python/network/fixtures.
+`cargo test --release` — **42 tests, ~0.6s**, no python/network/fixtures.
 - Unit: codecs (bin2-delta shuffle+LZ4, u8+exception counts, spill runs incl. ranged readers),
   k-way merge semantics, pairs parsing, coarsening bin map, genome/BED views, cooler writer
   (round-trip, index validity, append order, preset parsing), parallel-gzip direct chunks.
@@ -40,6 +40,19 @@ External cross-check: `scripts/validate_vs_cooler.py` (streams a full pixel/bins
 comparison at billion-pixel scale, then verifies the file through python `cooler`).
 
 ## Review findings — status
+
+Fixed in the post-alpha review batch (2026-08-09, see CHANGELOG "Unreleased"): raw
+`H5Dwrite_chunk` raced the safe-API readers in parallel merge (now under the crate's global
+lock; no measurable cost — 1.1B-pixel gzip merge 29s vs 32s for the pre-fix binary on the same
+warm cache); `zoomify --resolutions` accepted non-divisible/finer-than-base lists (silent
+coordinate corruption — now validated, and the cascade builds each level from the coarsest
+built divisor, so base-omitting/non-chain lists work); `bins/chrom` restored to a real HDF5
+ENUM (schema-compliant, values unchanged); failed merge/cload no longer leave valid-looking
+partial outputs (workers joined before finalize + delete-on-error); cload validates positions
+against chromosome lengths; parallel-merge RAM formula includes the input count; assorted
+loud-refusals (zero merge inputs, >2.1Gb chroms, >64-byte names, i64 key overflow at ~3e9
+bins, `--mem`/`--chunksize` now mutually exclusive); python API caches weights and reuses
+rows on cis fetches. Test suite 39 → 42.
 
 Fixed in this pass (P1): silent `as i32` count wrap at ~2.1e9 (now **saturating with a warning**;
 i32 storage is a deliberate choice, accumulators stay i64); merge accepted mismatched inputs;
@@ -59,9 +72,10 @@ Bugs caught by the new tests before they reached data:
 ## Known limits / open items
 - **balance is RAM-bound by design**: it holds a ~2–2.5 B/pixel scratch in memory, so a 100B+
   pixel cooler needs hundreds of GB. cload/merge/zoomify are streaming and are not.
-- Chrom lengths are stored i32 → 2.1 Gb per chromosome (same limit as cooler).
-- `bins/chrom` is plain int32, not an HDF5 enum (cooler maps it via `chrom_offset`).
-- `read_meta` reads fixed-length chrom names at widths 8/16/32/64 only.
+- Chrom lengths are stored i32 → 2.1 Gb per chromosome (same limit as cooler; now a loud
+  refusal instead of a silent wrap).
+- `read_meta` reads fixed-length chrom names only (variable-length string names from foreign
+  writers are not handled).
 - IC can plateau without converging on very sparse/disconnected masked matrices (it reports
   `converged=false`); this matches cooler's behaviour.
 - Balance perf levers not taken: per-tile CSR for bin1, tile-size sweep, persistent rayon pool.

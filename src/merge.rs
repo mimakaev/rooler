@@ -88,7 +88,6 @@ pub fn merge_sources<S: BlockSource>(
 }
 
 /// Merge sorted key/count sources directly into a cooler writer (bin1,bin2,count).
-/// nthreads reserved for the ranged-parallel path (currently single-thread heap merge).
 pub fn merge_sources_to_writer<S: BlockSource>(
     srcs: Vec<S>, nbins: i64, w: &mut CoolWriter,
 ) -> Result<u64> {
@@ -105,7 +104,7 @@ pub fn merge_sources_to_writer<S: BlockSource>(
 }
 
 /// One-line warning when counts saturated at i32::MAX (storage dtype is i32 by design).
-fn warn_clamped(n: u64) {
+pub(crate) fn warn_clamped(n: u64) {
     if n > 0 {
         eprintln!("  WARNING: {} pixels clamped at i32::MAX (counts are stored as i32)", n);
     }
@@ -121,6 +120,10 @@ fn check_inputs_match(meta: &crate::cooler::Meta, paths: &[String], res: Option<
         }
         if m.nbins != meta.nbins {
             anyhow::bail!("merge: {} has {} bins but {} has {}", p, m.nbins, paths[0], meta.nbins);
+        }
+        if m.names.len() != meta.names.len() {
+            anyhow::bail!("merge: {} has {} chromosomes but {} has {}",
+                p, m.names.len(), paths[0], meta.names.len());
         }
         if m.names != meta.names {
             let d = m.names.iter().zip(meta.names.iter()).position(|(a, b)| a != b);
@@ -247,6 +250,7 @@ pub fn merge_coolers_parallel(
     let meta = read_meta(&paths[0], res)?;
     check_inputs_match(&meta, paths, res)?;
     let nbins = meta.nbins as i64;
+    crate::cooler::check_key_space(nbins)?;
     let chromsizes: Vec<(String, i64)> = meta.names.iter().cloned().zip(meta.lengths.iter().cloned()).collect();
     let asm = match assembly {
         Some(a) if !a.trim().is_empty() => a.trim().to_string(),
@@ -265,7 +269,11 @@ pub fn merge_coolers_parallel(
     for b in 0..meta.nbins { acc += per[b]; if acc >= target && bounds.len() < p { bounds.push(b + 1); acc = 0; } }
     bounds.push(meta.nbins);
     let nranges = bounds.len() - 1;
-    let block = ((mem_gb * 0.3 * 1e9 / (24.0 * nranges as f64)) as usize).min(4_000_000).max(1 << 16);
+    // each range holds one decoded block per input cursor (~24 B/pixel incl. read transients),
+    // so resident memory scales with ranges x inputs x block — k must be in the denominator
+    let k = paths.len().max(1);
+    let block = ((mem_gb * 0.3 * 1e9 / (24.0 * nranges as f64 * k as f64)) as usize)
+        .min(4_000_000).max(1 << 16);
     if log { eprintln!("  merge(parallel): {} inputs, {} ranges, block={} pix, assembly={}", paths.len(), nranges, block, asm); }
 
     let paths_a = Arc::new(paths.to_vec());
@@ -298,13 +306,20 @@ pub fn merge_coolers_parallel(
         }));
     }
     // writer drains ranges in order (range r blocks until produced; later ranges merge concurrently)
+    let mut guard = crate::cooler::PartialFileGuard::new(out);
     let mut w = CoolWriter::create(out, &meta.names, &meta.lengths, meta.binsize, meta.nbins, &meta.chrom_offset, comp, &asm)?;
+    guard.arm();
     let mut nnz = 0u64;
     for r in 0..nranges {
         while let Ok((b1, b2, c)) = rxs[r].recv() { w.append(&b1, &b2, &c)?; nnz += b1.len() as u64; }
     }
+    // a worker error also closes its channel, so the drain loop above cannot tell a finished
+    // range from a failed one — join and check every worker BEFORE finalizing the output
+    for h in handles {
+        h.join().map_err(|_| anyhow::anyhow!("merge worker thread panicked"))??;
+    }
     w.close()?;
-    for h in handles { h.join().unwrap()?; }
+    guard.defuse();
     warn_clamped(nclamped.load(Ordering::Relaxed));
     if log { eprintln!("  merge(parallel) DONE: {} pixels in {:.0}s", nnz, t0.elapsed().as_secs_f64()); }
     Ok(nnz)
@@ -317,6 +332,7 @@ pub fn merge_coolers(
     let meta = read_meta(&paths[0], res)?;
     check_inputs_match(&meta, paths, res)?;
     let nbins = meta.nbins as i64;
+    crate::cooler::check_key_space(nbins)?;
     // no mystery coolers: assembly from override, else inputs, else fingerprint, else refuse
     let chromsizes: Vec<(String, i64)> = meta.names.iter().cloned().zip(meta.lengths.iter().cloned()).collect();
     let asm = match assembly {
@@ -331,8 +347,10 @@ pub fn merge_coolers(
         .map(|p| CoolerPix::open(p, res, meta.nbins, block))
         .collect::<Result<_>>()?;
     if log { eprintln!("  merge {} coolers, {} nbins, assembly={}, block={} pix (mem {:.1}G)", k, meta.nbins, asm, block, mem_gb); }
+    let mut guard = crate::cooler::PartialFileGuard::new(out);
     let mut w = CoolWriter::create(out, &meta.names, &meta.lengths, meta.binsize, meta.nbins,
         &meta.chrom_offset, comp, &asm)?;
+    guard.arm();
     let emit_block = 1 << 22;
     let mut nclamped = 0u64;
     let nnz = merge_sources(srcs, emit_block, |keys, cnts| {
@@ -342,6 +360,7 @@ pub fn merge_coolers(
         w.append(&b1, &b2, &c)
     })?;
     w.close()?;
+    guard.defuse();
     warn_clamped(nclamped);
     if log { eprintln!("  merge DONE: {} pixels in {:.1}s", nnz, t0.elapsed().as_secs_f64()); }
     Ok(nnz)

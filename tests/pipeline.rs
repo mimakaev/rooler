@@ -350,3 +350,58 @@ fn ops_refuse_bad_input() -> Result<()> {
     std::fs::remove_dir_all(&dir).ok();
     Ok(())
 }
+
+/// `--resolutions` must be validated (a truncated coarsening factor silently corrupts
+/// coordinates), and a list that omits the base or needs non-chain factors must build exactly
+/// the levels it names, each correct against the brute-force coarse oracle.
+#[test]
+fn zoomify_resolution_lists_are_validated_and_flexible() -> Result<()> {
+    let case = make_case("zres", 20_000, 99)?;
+    let d = &case.dir;
+    let p = |n: &str| d.join(n).to_str().unwrap().to_string();
+    let base = p("base.cool");
+    cload::cload(case.pairs.to_str().unwrap(), BINSIZE, &base, 0.01, 2,
+        Comp::parse("none")?, &p("runs"), None, false)?;
+
+    // non-integer multiple of the base -> hard error, not a truncated factor
+    let e = zoomify::zoomify(&base, &p("bad1.mcool"), Some(vec![BINSIZE, BINSIZE * 5 / 2]),
+        Comp::parse("none")?, None, false).unwrap_err();
+    assert!(e.to_string().contains("integer multiple"), "unexpected: {}", e);
+    // finer than the base -> hard error
+    let e = zoomify::zoomify(&base, &p("bad2.mcool"), Some(vec![BINSIZE / 2, BINSIZE]),
+        Comp::parse("none")?, None, false).unwrap_err();
+    assert!(e.to_string().contains("finer"), "unexpected: {}", e);
+
+    // base omitted + 2x/3x (not chainwise divisible): exactly the requested levels exist
+    let mc = p("skip.mcool");
+    zoomify::zoomify(&base, &mc, Some(vec![BINSIZE * 2, BINSIZE * 3]),
+        Comp::parse("none")?, None, false)?;
+    {
+        let f = hdf5::File::open(&mc)?;
+        assert!(f.link_exists(&format!("resolutions/{}", BINSIZE * 2)));
+        assert!(f.link_exists(&format!("resolutions/{}", BINSIZE * 3)));
+        assert!(!f.link_exists(&format!("resolutions/{}", BINSIZE)),
+            "wrote an unrequested base level");
+    }
+    // both levels must match the brute-force coarse oracle (3x comes straight from the base)
+    for factor in [2i64, 3] {
+        let coarse = BINSIZE * factor;
+        let cn1 = nb(CHR1, coarse);
+        let fine1 = case.nbins1;
+        let cmap = |b: i64| -> i64 {
+            if b < fine1 { b * BINSIZE / coarse } else { cn1 + (b - fine1) * BINSIZE / coarse }
+        };
+        let mut want: HashMap<(i64, i64), i64> = HashMap::new();
+        for (&(b1, b2), &v) in &case.expect {
+            let (x, y) = (cmap(b1), cmap(b2));
+            let (lo, hi) = if x <= y { (x, y) } else { (y, x) };
+            *want.entry((lo, hi)).or_insert(0) += v;
+        }
+        let got = read_pixels(&mc, &format!("resolutions/{}", coarse))?;
+        assert_matches_oracle(&got, &want, 1, &format!("zoomify {}x", factor));
+        assert_eq!(got.2.iter().map(|&x| x as i64).sum::<i64>(), 20_000,
+            "{}x level loses counts", factor);
+    }
+    std::fs::remove_dir_all(d).ok();
+    Ok(())
+}

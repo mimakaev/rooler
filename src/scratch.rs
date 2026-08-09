@@ -41,7 +41,7 @@ pub fn enc_count(cn: &[i32]) -> Vec<u8> {
 }
 pub fn dec_count(buf: &[u8], npix: usize, out: &mut [i32]) {
     let nexc = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
-    let mut p = 4;
+    let p = 4;
     let idx_end = p + 4 * nexc; let val_end = idx_end + 4 * nexc;
     let base = decompress(&buf[val_end..], npix).unwrap();
     for i in 0..npix { out[i] = base[i] as i32; }
@@ -50,7 +50,6 @@ pub fn dec_count(buf: &[u8], npix: usize, out: &mut [i32]) {
         let v = u32::from_le_bytes(buf[idx_end + 4 * k..idx_end + 4 * k + 4].try_into().unwrap()) as i32;
         out[i] = v;
     }
-    let _ = p; p = val_end; let _ = p;
 }
 
 pub struct Scratch {

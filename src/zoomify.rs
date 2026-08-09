@@ -3,7 +3,7 @@
 //! because fine pixels are sorted by bin1 the coarse bin1 is non-decreasing, so we accumulate one
 //! coarse row at a time (sort its bin2 + sum) and emit. O(nnz), bounded memory, no external sort.
 use crate::cooler::{CoolWriter, Comp};
-use anyhow::Result;
+use anyhow::{bail, Result};
 use hdf5::File;
 use std::time::Instant;
 
@@ -143,26 +143,30 @@ mod tests {
 
     #[test]
     fn row_agg_sums_duplicate_columns_and_clamps() {
-        // RowAgg's clamp path: two coarse-mapped pixels landing in one cell above i32::MAX
-        let mut agg = RowAgg::new(1 << 20);
-        agg.b2 = vec![5, 5, 7];
-        agg.c = vec![i64::from(i32::MAX), 10, 3];
-        agg.cur = 0;
-        let mut ob = (Vec::new(), Vec::new(), Vec::new());
-        // emulate flush_row's aggregation without a writer
-        let mut idx: Vec<usize> = (0..agg.b2.len()).collect();
-        idx.sort_unstable_by_key(|&i| agg.b2[i]);
-        let mut k = 0;
-        while k < idx.len() {
-            let key = agg.b2[idx[k]];
-            let mut s = 0i64;
-            while k < idx.len() && agg.b2[idx[k]] == key { s += agg.c[idx[k]]; k += 1; }
-            ob.0.push(agg.cur); ob.1.push(key);
-            ob.2.push(crate::cooler::clamp_count(s, &mut agg.nclamped));
-        }
-        assert_eq!(ob.1, vec![5, 7]);
-        assert_eq!(ob.2, vec![i32::MAX, 3], "summed count saturates instead of wrapping");
+        // Drive the real push/flush_row/finish path (not a re-implementation of it): two
+        // coarse-mapped pixels landing in one cell above i32::MAX must saturate, not wrap.
+        let d = std::env::temp_dir().join(format!("rooler_rowagg_{}", std::process::id()));
+        std::fs::remove_dir_all(&d).ok();
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("t.cool");
+        let names = vec!["chrA".to_string()];
+        let mut w = CoolWriter::create(p.to_str().unwrap(), &names, &[100], 10, 10, &[0, 10],
+            Comp::None, "test").unwrap();
+        let mut agg = RowAgg::new(1); // emit=1: every flushed row drains straight to the writer
+        agg.push(0, 5, i64::from(i32::MAX), &mut w).unwrap();
+        agg.push(0, 7, 3, &mut w).unwrap();
+        agg.push(0, 5, 10, &mut w).unwrap(); // unsorted duplicate column in the same row
+        agg.push(2, 1, 4, &mut w).unwrap();  // row change triggers the real flush_row
+        agg.finish(&mut w).unwrap();
         assert_eq!(agg.nclamped, 1);
+        w.close().unwrap();
+        let f = hdf5::File::open(p.to_str().unwrap()).unwrap();
+        assert_eq!(f.dataset("pixels/bin1_id").unwrap().read_1d::<i64>().unwrap().to_vec(), vec![0, 0, 2]);
+        assert_eq!(f.dataset("pixels/bin2_id").unwrap().read_1d::<i64>().unwrap().to_vec(), vec![5, 7, 1]);
+        assert_eq!(f.dataset("pixels/count").unwrap().read_1d::<i32>().unwrap().to_vec(),
+                   vec![i32::MAX, 3, 4], "summed count saturates instead of wrapping");
+        drop(f);
+        std::fs::remove_dir_all(&d).ok();
     }
 }
 
@@ -204,9 +208,25 @@ pub fn zoomify(src: &str, out: &str, resolutions: Option<Vec<i64>>, comp: Comp, 
         _ => crate::view::detect("", &chromsizes).map(|s| s.to_string()).ok_or_else(|| anyhow::anyhow!(
             "refusing to write an mcool without a genome assembly (source lacks one); pass --assembly <name>"))?,
     };
-    // resolution schedule: explicit, or double until very coarse
+    // resolution schedule: explicit, or double until very coarse. An explicit list is
+    // validated hard: a resolution finer than the base cannot be built, and a non-multiple
+    // would coarsen with a silently truncated factor — corrupt coordinates, no symptom.
     let reslist: Vec<i64> = match resolutions {
-        Some(mut v) => { v.sort(); v }
+        Some(mut v) => {
+            v.sort_unstable();
+            v.dedup();
+            if v.is_empty() { bail!("--resolutions: empty list"); }
+            for &r in &v {
+                if r < base_res {
+                    bail!("--resolutions: {} is finer than the base resolution {}", r, base_res);
+                }
+                if r % base_res != 0 {
+                    bail!("--resolutions: {} is not an integer multiple of the base resolution {}",
+                          r, base_res);
+                }
+            }
+            v
+        }
         None => {
             let mut v = vec![base_res]; let mut r = base_res;
             let (_, mut n) = offsets(&lengths, r);
@@ -224,49 +244,57 @@ pub fn zoomify(src: &str, out: &str, resolutions: Option<Vec<i64>>, comp: Comp, 
     let block = 1 << 22;
     let emit = 1 << 20;
 
-    // level 0: copy base from src -> resolutions/{base_res}
-    let (base_off, base_n) = offsets(&lengths, base_res);
-    {
-        let mut w = CoolWriter::create_in(&f, &format!("resolutions/{}", base_res), &names, &lengths,
-            base_res, base_n as usize, &base_off, comp, &asm)?;
-        let srcf = File::open(src)?;
-        let sg = srcf.group("/")?;
-        let mut ob1 = Vec::new(); let mut ob2 = Vec::new(); let mut oc = Vec::new();
-        stream_pixels(&sg, block, |a, b, c| {
-            ob1.extend_from_slice(a); ob2.extend_from_slice(b); oc.extend_from_slice(c);
-            if ob1.len() >= emit { w.append(&ob1, &ob2, &oc)?; ob1.clear(); ob2.clear(); oc.clear(); }
-            Ok(())
-        })?;
-        if !ob1.is_empty() { w.append(&ob1, &ob2, &oc)?; }
-        w.close()?;
-    }
-    if log { eprintln!("  [zoomify] {}bp copied ({} bins) {:.0}s", base_res, base_n, t0.elapsed().as_secs_f64()); }
-
-    // cascade coarser levels from the previous level in the output file
-    let mut prev_res = base_res;
-    for &res in reslist.iter().skip(1) {
-        let (map, coarse_off, coarse_n) = build_map(&lengths, prev_res, res);
-        let mut w = CoolWriter::create_in(&f, &format!("resolutions/{}", res), &names, &lengths,
-            res, coarse_n as usize, &coarse_off, comp, &asm)?;
-        let mut agg = RowAgg::new(emit);
-        let pg = f.group(&format!("resolutions/{}", prev_res))?;
-        stream_pixels(&pg, block, |a, b, c| {
-            for i in 0..a.len() {
-                let cb1 = map[a[i] as usize];
-                let cb2 = map[b[i] as usize];
-                agg.push(cb1, cb2, c[i] as i64, &mut w)?;
+    // Build every requested level, finest first. The base level is a straight copy of src; a
+    // coarser level streams from the coarsest already-built level that divides it (fewest pixels
+    // to read), falling back to the base cooler itself if none does — so a list that omits the
+    // base, or is not chainwise divisible, still builds every level it names, correctly.
+    let mut built: Vec<i64> = Vec::new();
+    for &res in &reslist {
+        if res == base_res {
+            let (base_off, base_n) = offsets(&lengths, base_res);
+            let mut w = CoolWriter::create_in(&f, &format!("resolutions/{}", base_res), &names, &lengths,
+                base_res, base_n as usize, &base_off, comp, &asm)?;
+            let srcf = File::open(src)?;
+            let sg = srcf.group("/")?;
+            let mut ob1 = Vec::new(); let mut ob2 = Vec::new(); let mut oc = Vec::new();
+            stream_pixels(&sg, block, |a, b, c| {
+                ob1.extend_from_slice(a); ob2.extend_from_slice(b); oc.extend_from_slice(c);
+                if ob1.len() >= emit { w.append(&ob1, &ob2, &oc)?; ob1.clear(); ob2.clear(); oc.clear(); }
+                Ok(())
+            })?;
+            if !ob1.is_empty() { w.append(&ob1, &ob2, &oc)?; }
+            w.close()?;
+            if log { eprintln!("  [zoomify] {}bp copied ({} bins) {:.0}s", base_res, base_n, t0.elapsed().as_secs_f64()); }
+        } else {
+            let from = built.iter().copied().filter(|&b| res % b == 0).max();
+            let srcf; // keeps the source file open when streaming from the base cooler
+            let (fine_res, pg) = match from {
+                Some(fr) => (fr, f.group(&format!("resolutions/{}", fr))?),
+                None => { srcf = File::open(src)?; (base_res, srcf.group("/")?) }
+            };
+            let (map, coarse_off, coarse_n) = build_map(&lengths, fine_res, res);
+            let mut w = CoolWriter::create_in(&f, &format!("resolutions/{}", res), &names, &lengths,
+                res, coarse_n as usize, &coarse_off, comp, &asm)?;
+            let mut agg = RowAgg::new(emit);
+            stream_pixels(&pg, block, |a, b, c| {
+                for i in 0..a.len() {
+                    let cb1 = map[a[i] as usize];
+                    let cb2 = map[b[i] as usize];
+                    agg.push(cb1, cb2, c[i] as i64, &mut w)?;
+                }
+                Ok(())
+            })?;
+            agg.finish(&mut w)?;
+            let nnz = w.nnz;
+            w.close()?;
+            if agg.nclamped > 0 {
+                eprintln!("  [zoomify] WARNING {}bp: {} pixels clamped at i32::MAX (counts are stored as i32)",
+                    res, agg.nclamped);
             }
-            Ok(())
-        })?;
-        agg.finish(&mut w)?;
-        let nnz = w.nnz;
-        w.close()?;
-        if agg.nclamped > 0 {
-            eprintln!("  [zoomify] WARNING {}bp: {} pixels clamped at i32::MAX (counts are stored as i32)",
-                res, agg.nclamped);
+            if log { eprintln!("  [zoomify] {}bp built from {}bp ({} bins, {} pix) {:.0}s",
+                res, fine_res, coarse_n, nnz, t0.elapsed().as_secs_f64()); }
         }
-        if log { eprintln!("  [zoomify] {}bp built ({} bins, {} pix) {:.0}s", res, coarse_n, nnz, t0.elapsed().as_secs_f64()); }
-        prev_res = res;
+        built.push(res);
     }
     if log { eprintln!("  zoomify DONE: {} resolutions in {:.0}s", reslist.len(), t0.elapsed().as_secs_f64()); }
     Ok(reslist)

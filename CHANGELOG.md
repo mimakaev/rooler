@@ -1,5 +1,43 @@
 # Changelog
 
+## Unreleased
+
+Review-fix batch (post-alpha code review; all outputs verified pixel-identical to alpha.1
+where behavior was meant to be unchanged, and the 1.1 B-pixel gzip merge benchmark shows no
+performance regression).
+
+### Fixed
+- **Thread-safety of the parallel gzip writer.** The raw `H5Dwrite_chunk` calls now run under
+  the hdf5 crate's global lock. Previously, `merge --threads >1` (gzip is the default preset)
+  had worker threads reading inputs through libhdf5 while the writer wrote chunks outside the
+  lock — undefined behavior on the stock non-threadsafe libhdf5 builds most systems ship.
+- **`zoomify --resolutions` is validated.** A resolution finer than the base or not an integer
+  multiple of it is a hard error (a truncated coarsening factor silently corrupted
+  coordinates before). Lists are deduplicated, and the cascade now builds each requested level
+  from the coarsest already-built level that divides it — so a list that omits the base or is
+  not chainwise divisible (e.g. `2000,3000` on a 1000 bp base) builds exactly the levels it
+  names, correctly. The base level is only written if requested.
+- **`bins/chrom` is a real HDF5 ENUM again** (the cooler schema type), with the chromosome
+  names as members — not bare int32 codes. Values are unchanged; h5py/cooler see the same
+  codes plus the name mapping.
+- **Failed ops no longer leave a valid-looking output behind.** merge joins its workers before
+  finalizing the file (a failed range used to be silently skipped, leaving a consistent cooler
+  missing pixels), and cload/merge delete a partially-written output on error. cload also
+  cleans its spill directory on failure.
+- **cload validates positions against chromosome lengths.** An out-of-range position (bad
+  chromsizes, malformed field) used to land silently in the next chromosome's bins.
+- **Parallel merge memory formula includes the input count** — merging many coolers under
+  `--mem` no longer overshoots the budget by a factor of k.
+- A pairs file whose final body line lacks a trailing newline no longer drops that pair when
+  it is the first body line; `merge` with zero inputs is a usage error, not a panic;
+  chromosomes over 2^31−1 bp and names over 64 bytes are refused loudly instead of silently
+  wrapping/panicking; `--mem` and `--chunksize` are mutually exclusive (precedence was
+  previously decided by sniffing whether `--mem` equalled its default); bin counts above
+  ~3.04e9 (i64 key overflow) are refused.
+- **Python read API:** balancing weights are read from disk once and cached on the open
+  handle (each `balanced()` fetch used to re-read the entire weight column), and a cis square
+  fetch reuses the pixel rows it already read instead of reading them from HDF5 twice.
+
 ## 0.1.0-alpha.1 — 2026-08-09
 
 First public alpha. All five ops work, are validated against `cooler`/`cooltools`, and have

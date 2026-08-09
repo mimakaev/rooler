@@ -11,13 +11,14 @@ enum Cmd {
     /// Merge N coolers (sum counts on matching pixels)
     Merge {
         out: String,
-        inputs: Vec<String>,
+        #[arg(required = true)] inputs: Vec<String>,
         #[arg(long)] res: Option<String>,
-        #[arg(long, default_value = "4.0")] mem: f64,
+        /// RAM budget in GB (default 4)
+        #[arg(long, conflicts_with = "chunksize")] mem: Option<f64>,
         #[arg(long, default_value = "gzip4")] preset: String,
         #[arg(long)] assembly: Option<String>,
         #[arg(long, alias = "nproc", default_value = "8")] threads: usize,
-        /// cooler compatibility: pixels per chunk; maps to --mem when --mem is left at default
+        /// cooler compatibility: pixels per chunk; maps to a --mem budget (mutually exclusive with --mem)
         #[arg(long)] chunksize: Option<u64>,
     },
     /// Load a .pairs.gz (or plain .pairs, or "-" for stdin) into a .cool at a fixed resolution
@@ -25,11 +26,12 @@ enum Cmd {
         pairs: String,
         binsize: i64,
         out: String,
-        #[arg(long, default_value = "4.0")] mem: f64,
+        /// RAM budget in GB (default 4)
+        #[arg(long, conflicts_with = "chunksize")] mem: Option<f64>,
         #[arg(long, alias = "nproc", default_value = "8")] threads: usize,
         #[arg(long, default_value = "gzip4")] preset: String,
         #[arg(long)] assembly: Option<String>,
-        /// cooler compatibility: pixels per chunk; maps to --mem when --mem is left at default
+        /// cooler compatibility: pixels per chunk; maps to a --mem budget (mutually exclusive with --mem)
         #[arg(long)] chunksize: Option<u64>,
     },
     /// Build a multi-resolution .mcool from a base .cool
@@ -65,15 +67,17 @@ enum Cmd {
 }
 
 /// cooler-compat shim: `--chunksize C` with `--nproc N` implies roughly C*N*40 bytes of
-/// working set (see MEMORY_CALIBRATION.md). Only applies when --mem was left at its default.
-fn mem_from_chunksize(mem: f64, chunksize: Option<u64>, threads: usize) -> f64 {
-    match chunksize {
-        Some(c) if (mem - 4.0).abs() < f64::EPSILON => {
+/// working set (see MEMORY_CALIBRATION.md). --mem and --chunksize are mutually exclusive
+/// (clap `conflicts_with`), so there is no precedence question; neither given -> 4 GB.
+fn resolve_mem(mem: Option<f64>, chunksize: Option<u64>, threads: usize) -> f64 {
+    match (mem, chunksize) {
+        (Some(m), _) => m,
+        (None, Some(c)) => {
             let m = (c as f64 * threads as f64 * 40e-9).max(0.25);
             eprintln!("  --chunksize {} x --nproc {} -> --mem {:.2} GB", c, threads, m);
             m
         }
-        _ => mem,
+        (None, None) => 4.0,
     }
 }
 
@@ -81,13 +85,13 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Merge { out, inputs, res, mem, preset, assembly, threads, chunksize } => {
-            let mem = mem_from_chunksize(mem, chunksize, threads);
+            let mem = resolve_mem(mem, chunksize, threads);
             let paths: Vec<String> = inputs.iter().map(|s| s.split("::").next().unwrap().to_string()).collect();
             let r = res.or_else(|| inputs[0].split("::").nth(1).map(|g| g.rsplit('/').next().unwrap().to_string()));
             merge::merge_coolers_parallel(&paths, r.as_deref(), &out, mem, threads, cooler::Comp::parse(&preset)?, assembly.as_deref(), true)?;
         }
         Cmd::Cload { pairs, binsize, out, mem, threads, preset, assembly, chunksize } => {
-            let mem = mem_from_chunksize(mem, chunksize, threads);
+            let mem = resolve_mem(mem, chunksize, threads);
             let tmp = format!("{}.runs", out);
             cload::cload(&pairs, binsize, &out, mem, threads, cooler::Comp::parse(&preset)?, &tmp, assembly.as_deref(), true)?;
         }

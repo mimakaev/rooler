@@ -6,8 +6,12 @@
 //! resulting file is ordinary SHUFFLE+DEFLATE HDF5 that vanilla cooler/h5py read with no
 //! plugins — we only move deflate off HDF5's single thread. Measured ~8.6x on the prototype.
 //!
-//! HDF5 calls all happen on the caller's thread; only compression is parallel.
-use anyhow::{bail, Result};
+//! HDF5 calls all happen on the caller's thread; only compression is parallel. The raw
+//! `H5Dwrite_chunk` FFI additionally runs under the hdf5 crate's global lock (`hdf5::sync::sync`),
+//! because other threads may be inside libhdf5 through the safe API at the same time (e.g. the
+//! ranged-parallel merge reads input pixels on worker threads while this writer drains) and stock
+//! libhdf5 builds are not threadsafe.
+use anyhow::{anyhow, bail, Result};
 use hdf5_metno_sys::h5d::H5Dwrite_chunk;
 use hdf5_metno_sys::h5i::hid_t;
 use libdeflater::{CompressionLvl, Compressor};
@@ -32,8 +36,8 @@ fn shuffle(src: &[u8], esize: usize) -> Vec<u8> {
 
 /// zlib-wrapped deflate (windowBits 15, 0x78 header) — what the HDF5 gzip filter emits/expects.
 /// Byte-identity with HDF5's own output is NOT required: any valid zlib stream inflates fine.
-fn zlib(src: &[u8], level: i32) -> Vec<u8> {
-    let mut c = Compressor::new(CompressionLvl::new(level).unwrap_or(CompressionLvl::default()));
+fn zlib(src: &[u8], level: CompressionLvl) -> Vec<u8> {
+    let mut c = Compressor::new(level);
     let mut out = vec![0u8; c.zlib_compress_bound(src.len())];
     let n = c.zlib_compress(src, &mut out).expect("zlib_compress into a bound-sized buffer");
     out.truncate(n);
@@ -45,7 +49,7 @@ pub struct ParColumn {
     dset: hdf5::Dataset,
     esize: usize,   // bytes per element
     chunk: usize,   // elements per chunk
-    level: i32,
+    level: CompressionLvl,
     staged: Vec<u8>,        // raw little-endian bytes not yet written
     chunks_written: usize,
     elems_written: usize,   // elements already in the dataset (= chunks_written * chunk)
@@ -55,18 +59,26 @@ pub struct ParColumn {
 impl ParColumn {
     /// `dset` must be 1-D, extendible, chunked with exactly `chunk` elements and a
     /// SHUFFLE+DEFLATE filter pipeline (that is what we reproduce byte-wise).
-    pub fn new(dset: hdf5::Dataset, esize: usize, chunk: usize, level: u8) -> ParColumn {
-        ParColumn { dset, esize, chunk, level: level as i32, staged: Vec::new(),
-                    chunks_written: 0, elems_written: 0, finished: false }
+    pub fn new(dset: hdf5::Dataset, esize: usize, chunk: usize, level: u8) -> Result<ParColumn> {
+        let dsize = dset.dtype()?.size();
+        if dsize != esize {
+            bail!("ParColumn: dataset element size {} != declared esize {}", dsize, esize);
+        }
+        let level = CompressionLvl::new(level as i32)
+            .map_err(|e| anyhow!("bad deflate level {}: {:?}", level, e))?;
+        Ok(ParColumn { dset, esize, chunk, level, staged: Vec::new(),
+                       chunks_written: 0, elems_written: 0, finished: false })
     }
 
     pub fn push_i64(&mut self, v: &[i64]) -> Result<()> {
+        if self.finished { bail!("ParColumn: push after finish()"); }
         self.staged.reserve(v.len() * 8);
         for &x in v { self.staged.extend_from_slice(&x.to_le_bytes()); }
         self.maybe_flush()
     }
 
     pub fn push_i32(&mut self, v: &[i32]) -> Result<()> {
+        if self.finished { bail!("ParColumn: push after finish()"); }
         self.staged.reserve(v.len() * 4);
         for &x in v { self.staged.extend_from_slice(&x.to_le_bytes()); }
         self.maybe_flush()
@@ -93,17 +105,18 @@ impl ParColumn {
         Ok(())
     }
 
-    /// Extend the dataset then write the pre-compressed chunks. HDF5 calls, this thread only.
+    /// Extend the dataset then write the pre-compressed chunks. HDF5 calls, this thread only,
+    /// and under the crate's global lock (other threads may be inside libhdf5 via the safe API).
     fn write_blobs(&mut self, blobs: &[Vec<u8>], new_elems: usize) -> Result<()> {
         self.dset.resize([self.elems_written + new_elems])?;
         self.elems_written += new_elems;
         for blob in blobs {
             let offset = [(self.chunks_written * self.chunk) as u64];
             // filters = 0: no filter in the pipeline was skipped for this chunk
-            let rc = unsafe {
+            let rc = hdf5::sync::sync(|| unsafe {
                 H5Dwrite_chunk(self.dset.id() as hid_t, 0, 0, offset.as_ptr(),
                                blob.len(), blob.as_ptr().cast())
-            };
+            });
             if rc < 0 { bail!("H5Dwrite_chunk failed at chunk {}", self.chunks_written); }
             self.chunks_written += 1;
         }
@@ -114,10 +127,10 @@ impl ParColumn {
     /// full chunk size (HDF5 stores whole chunks; the pad lies past the extent and is never read).
     pub fn finish(&mut self) -> Result<()> {
         if self.finished { return Ok(()); }
-        self.finished = true;
         self.flush_full_chunks()?;
         if self.staged.is_empty() {
             self.dset.resize([self.elems_written])?;
+            self.finished = true;
             return Ok(());
         }
         let cbytes = self.chunk * self.esize;
@@ -129,12 +142,14 @@ impl ParColumn {
         self.dset.resize([self.elems_written + tail_elems])?;
         self.elems_written += tail_elems;
         let offset = [(self.chunks_written * self.chunk) as u64];
-        let rc = unsafe {
+        let rc = hdf5::sync::sync(|| unsafe {
             H5Dwrite_chunk(self.dset.id() as hid_t, 0, 0, offset.as_ptr(),
                            blob.len(), blob.as_ptr().cast())
-        };
+        });
         if rc < 0 { bail!("H5Dwrite_chunk failed on the final partial chunk"); }
         self.chunks_written += 1;
+        // only now: a failed finish must not report success on retry
+        self.finished = true;
         Ok(())
     }
 }
@@ -171,7 +186,7 @@ mod tests {
             let f = hdf5::File::create(p.to_str().unwrap()).unwrap();
             let ds = f.new_dataset::<i32>().shape((0..,)).chunk([chunk])
                 .shuffle().deflate(4).create("x").unwrap();
-            let mut col = ParColumn::new(ds, 4, chunk, 4);
+            let mut col = ParColumn::new(ds, 4, chunk, 4).unwrap();
             // push in awkward slices so chunk boundaries fall mid-push
             col.push_i32(&data[..100]).unwrap();
             col.push_i32(&data[100..2500]).unwrap();
@@ -205,7 +220,7 @@ mod tests {
             let f = hdf5::File::create(pb.to_str().unwrap()).unwrap();
             let ds = f.new_dataset::<i64>().shape((0..,)).chunk([chunk]).shuffle().deflate(4)
                 .create("x").unwrap();
-            let mut col = ParColumn::new(ds, 8, chunk, 4);
+            let mut col = ParColumn::new(ds, 8, chunk, 4).unwrap();
             col.push_i64(&data).unwrap();
             col.finish().unwrap();
         }
@@ -231,7 +246,7 @@ mod tests {
                 let f = hdf5::File::create(p.to_str().unwrap()).unwrap();
                 let ds = f.new_dataset::<i32>().shape((0..,)).chunk([chunk]).shuffle().deflate(1)
                     .create("x").unwrap();
-                let mut col = ParColumn::new(ds, 4, chunk, 1);
+                let mut col = ParColumn::new(ds, 4, chunk, 1).unwrap();
                 col.push_i32(&data).unwrap();
                 col.finish().unwrap();
                 col.finish().unwrap(); // idempotent

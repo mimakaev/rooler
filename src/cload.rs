@@ -28,7 +28,13 @@ pub fn unshuffle8(buf: &[u8], n: usize) -> Vec<i64> {
     (0..n).map(|i| { let mut b = [0u8; 8]; for p in 0..8 { b[p] = buf[p * n + i]; } i64::from_le_bytes(b) }).collect()
 }
 
-pub struct Bins { pub cmap: HashMap<Vec<u8>, i64>, pub off_lo: Vec<i64>, pub nbins: i64, pub binsize: i64 }
+pub struct Bins {
+    pub cmap: HashMap<Vec<u8>, i64>,
+    pub off_lo: Vec<i64>,   // first bin of each chromosome
+    pub off_hi: Vec<i64>,   // one past the last bin of each chromosome
+    pub nbins: i64,
+    pub binsize: i64,
+}
 
 #[inline]
 pub fn fast_atoi(b: &[u8]) -> i64 { let mut x = 0i64; for &c in b { x = x * 10 + (c - b'0') as i64; } x }
@@ -68,6 +74,16 @@ pub fn parse_line(line: &[u8], bins: &Bins, cache: &mut ChromCache) -> Result<Op
              else { let v = lookup(c2)?; cache.c2 = c2.to_vec(); cache.i2 = v; v };
     let b1 = bins.off_lo[i1 as usize] + p1 / bins.binsize;
     let b2 = bins.off_lo[i2 as usize] + p2 / bins.binsize;
+    // out-of-range positions (bad chromsizes, malformed/non-numeric fields) would silently land
+    // in the NEXT chromosome's bins — corrupt output, no symptom. Refuse the line instead.
+    if b1 >= bins.off_hi[i1 as usize] {
+        bail!("pairs line has position {} beyond chromosome {:?}",
+              p1, String::from_utf8_lossy(c1));
+    }
+    if b2 >= bins.off_hi[i2 as usize] {
+        bail!("pairs line has position {} beyond chromosome {:?}",
+              p2, String::from_utf8_lossy(c2));
+    }
     let (lo, hi) = if b1 <= b2 { (b1, b2) } else { (b2, b1) };
     Ok(Some(lo * bins.nbins + hi))
 }
@@ -172,7 +188,12 @@ pub fn cload(pairs: &str, binsize: i64, out: &str, mem_gb: f64, nthreads: usize,
     let mut body_tail: Vec<u8> = Vec::new();
     'hdr: loop {
         let n = rd.read(&mut chunk)?;
-        if n == 0 { break; }
+        if n == 0 {
+            // EOF with an unterminated final line: if it is a body line, it must still be
+            // counted (the producer path adds the missing newline; this path must not drop it)
+            if !leftover.is_empty() && leftover[0] != b'#' { body_tail = std::mem::take(&mut leftover); }
+            break;
+        }
         leftover.extend_from_slice(&chunk[..n]);
         let mut start = 0;
         while let Some(rel) = memchr(b'\n', &leftover[start..]) {
@@ -195,16 +216,19 @@ pub fn cload(pairs: &str, binsize: i64, out: &str, mem_gb: f64, nthreads: usize,
         }
         leftover.drain(..start);
     }
+    if binsize <= 0 { bail!("binsize must be positive, got {}", binsize); }
     let mut off_lo = vec![0i64];
     for &l in &lengths { off_lo.push(off_lo.last().unwrap() + (l + binsize - 1) / binsize); }
     let nbins = *off_lo.last().unwrap();
+    crate::cooler::check_key_space(nbins)?;
+    let off_hi = off_lo[1..].to_vec();
     off_lo.pop();
     // no mystery coolers: require a genome assembly (explicit or fingerprinted) or refuse
     let chromsizes: Vec<(String, i64)> = names.iter().cloned().zip(lengths.iter().cloned()).collect();
     let asm = crate::view::resolve_assembly(assembly, &chromsizes).ok_or_else(|| anyhow!(
         "refusing to create a cooler without a genome assembly: could not detect it from the chromsizes; pass --assembly <name>"))?;
     if log { eprintln!("  genome-assembly: {}", asm); }
-    let bins = Arc::new(Bins { cmap, off_lo, nbins, binsize });
+    let bins = Arc::new(Bins { cmap, off_lo, off_hi, nbins, binsize });
 
     // --- spawn workers ---
     std::fs::create_dir_all(tmpdir)?;
@@ -233,16 +257,33 @@ pub fn cload(pairs: &str, binsize: i64, out: &str, mem_gb: f64, nthreads: usize,
     if let Some(mut c) = child { c.wait()?; }
 
     let mut run_paths = Vec::new(); let mut npairs = 0u64;
-    for h in handles { let (p, np) = h.join().unwrap()?; run_paths.extend(p); npairs += np; }
+    let mut phase1_err: Option<anyhow::Error> = None;
+    for h in handles {
+        match h.join() {
+            Ok(Ok((p, np))) => { run_paths.extend(p); npairs += np; }
+            Ok(Err(e)) => phase1_err = Some(e),
+            Err(_) => phase1_err = Some(anyhow!("cload worker thread panicked")),
+        }
+    }
+    if let Some(e) = phase1_err {
+        let _ = std::fs::remove_dir_all(tmpdir); // spill runs can be huge; don't leave them behind
+        return Err(e);
+    }
     if log { eprintln!("  phase1: {} pairs -> {} runs, {:.0}s ({:.0} Mpairs/s)",
         npairs, run_paths.len(), t0.elapsed().as_secs_f64(), npairs as f64 / t0.elapsed().as_secs_f64() / 1e6); }
 
     // --- phase B: ranged-parallel k-way drain-and-count merge over the spilled runs ---
     let mut off = vec![0i64];
     for &l in &lengths { off.push(off.last().unwrap() + (l + binsize - 1) / binsize); }
+    let mut guard = crate::cooler::PartialFileGuard::new(out);
     let mut w = CoolWriter::create(out, &names, &lengths, binsize, nbins as usize, &off, comp, &asm)?;
-    let nnz = merge_runs_parallel(&run_paths, nbins, nthreads, mem_gb, &mut w, log)?;
+    guard.arm();
+    let nnz = match merge_runs_parallel(&run_paths, nbins, nthreads, mem_gb, &mut w, log) {
+        Ok(n) => n,
+        Err(e) => { let _ = std::fs::remove_dir_all(tmpdir); return Err(e); } // guard removes `out`
+    };
     w.close()?;
+    guard.defuse();
     for p in &run_paths { let _ = std::fs::remove_file(p); }
     let _ = std::fs::remove_dir(tmpdir);
     if log { eprintln!("  cload DONE: {} pairs -> {} pixels, {:.0}s", npairs, nnz, t0.elapsed().as_secs_f64()); }
@@ -260,7 +301,7 @@ fn merge_runs_parallel(
     let nruns = run_paths.len().max(1);
     let budget = ((mem_gb * 0.5 * 1e9) / (nruns as f64 * per_reader_bytes)) as usize;
     let p = nthreads.min(budget).max(1);
-    if p <= 1 || nruns == 0 {
+    if p <= 1 {
         if log { eprintln!("  phase2: serial merge ({} runs)", nruns); }
         return merge_sources_to_writer(
             run_paths.iter().map(|s| RunReader::open(s)).collect::<Result<Vec<_>>>()?, nbins, w);
@@ -310,9 +351,11 @@ fn merge_runs_parallel(
     for rx in &rxs {
         while let Ok((b1, b2, c)) = rx.recv() { w.append(&b1, &b2, &c)?; nnz += b1.len() as u64; }
     }
-    for h in handles { h.join().unwrap()?; }
-    let nc = nclamped.load(std::sync::atomic::Ordering::Relaxed);
-    if nc > 0 { eprintln!("  WARNING: {} pixels clamped at i32::MAX (counts are stored as i32)", nc); }
+    // a worker error also closes its channel; join and check BEFORE the caller finalizes the file
+    for h in handles {
+        h.join().map_err(|_| anyhow!("phase-B merge thread panicked"))??;
+    }
+    crate::merge::warn_clamped(nclamped.load(std::sync::atomic::Ordering::Relaxed));
     Ok(nnz)
 }
 
@@ -394,7 +437,22 @@ mod tests {
         let mut cmap = HashMap::new();
         cmap.insert(b"chr1".to_vec(), 0i64);
         cmap.insert(b"chr2".to_vec(), 1i64);
-        Bins { cmap, off_lo: vec![0, 10], nbins: 20, binsize: 100 }
+        Bins { cmap, off_lo: vec![0, 10], off_hi: vec![10, 20], nbins: 20, binsize: 100 }
+    }
+
+    #[test]
+    fn parse_line_rejects_out_of_range_positions() {
+        let b = bins3();
+        let mut c = ChromCache::default();
+        // position beyond the chromosome length must error, not spill into the next chrom's bins
+        let e = parse_line(b"r1\tchr1\t1500\tchr1\t350\t+\t+", &b, &mut c).unwrap_err();
+        assert!(e.to_string().contains("beyond chromosome"), "unexpected error: {}", e);
+        let e = parse_line(b"r2\tchr1\t150\tchr2\t99999\t+\t+", &b, &mut c).unwrap_err();
+        assert!(e.to_string().contains("beyond chromosome"), "unexpected error: {}", e);
+        // a non-numeric position parses to garbage; the bin bound catches the structural damage
+        assert!(parse_line(b"r3\tchr1\tzzz\tchr1\t350\t+\t+", &b, &mut c).is_err());
+        // last valid position of the last bin still parses
+        assert_eq!(parse_line(b"r4\tchr2\t999\tchr2\t999\t+\t+", &b, &mut c).unwrap(), Some(19 * 20 + 19));
     }
 
     #[test]
