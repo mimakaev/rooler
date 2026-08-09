@@ -48,8 +48,55 @@ The speedup is *smaller* at the larger size, which is worth being straight about
 iteration itself is ~4 s. That build cost is paid once and amortised across re-balances, but it
 is real, and it means the headline ratio depends on how compressed your input is.
 
-We deliberately did **not** run cooler `balance` on the 2.5-billion-pixel or 81-billion-pixel
-coolers. Those runs take hours, and the comparison would say nothing the smaller sizes do not.
+---
+
+## At 2.5 billion pixels
+
+This is the size where waiting for the reference implementation stops being reasonable, so it
+is the comparison that matters most. Everything below runs on one cooler —
+**2,563,532,430 pixels over 12,537,161 bins at 256 bp** (an ENCODE hg38 micro-C file) — with
+both tools at their own defaults, i.e. what you would actually type.
+
+| op | cooler 0.10.4 | rooler | speedup |
+|---|---|---|---|
+| `balance` (genome-wide IC, 12.5 M bins) | 670 s | **88 s** | **7.6×** |
+| `balance` with `--block 65536` | 670 s | **51 s** | **13×** |
+| `coarsen` 256 → 512 → 1024 → 2048 | 1955 s | **460 s** | **4.3×** |
+| `cload` 2.61 B pairs → 256 bp | 3258 s (54 min) | **114 s** | **29×** |
+
+**The results are the same results.** `cload` output is **byte-identical to cooler's** — all
+2,563,532,077 pixels, every bin1/bin2/count value. All three balance runs select an identical
+**11,239,212** good bins — zero mask disagreements — and the weights agree to a median of
+**9.9e-6**. Every coarsened level matches cooler exactly, bin for bin and pixel for pixel:
+
+| level | bins (rooler / cooler) | pixels (rooler / cooler) |
+|---|---|---|
+| 256 bp | 12,537,161 / 12,537,161 | 2,563,532,430 / 2,563,532,430 |
+| 512 bp | 6,268,696 / 6,268,696 | 2,519,298,536 / 2,519,298,536 |
+| 1024 bp | 3,134,464 / 3,134,464 | 2,459,691,793 / 2,459,691,793 |
+| 2048 bp | 1,567,341 / 1,567,341 | 2,384,753,647 / 2,384,753,647 |
+
+rooler's outputs are also smaller: 5.83 GB vs 6.03 GB for the cooler, 19.89 GB vs 21.49 GB for
+the mcool (−7.4%).
+
+*(The balance and coarsen inputs are one cooler of 2,563,532,430 pixels, built before the
+1-based binning fix below; both tools were given that same file, so the comparison stands. The
+`cload` row rebuilds from the pairs and lands on 2,563,532,077 — cooler's count exactly.)*
+
+### Per iteration, the gap is much larger than the wall clock suggests
+
+rooler pays a one-time cost to decompress the matrix into a compact in-memory form, then
+iterates over that. Splitting the balance runs accordingly:
+
+| | build | per IC iteration | iterations |
+|---|---|---|---|
+| cooler | — | **67 s** | 10 |
+| rooler (default) | 18 s | **8.1 s** | 7 |
+| rooler (`--block`) | 29 s | **2.7 s** | 7 |
+
+So the *iteration* — the thing that dominates when you tighten tolerance, re-balance, or move
+to a finer resolution — is **25× faster** with the cache-blocked kernel. The end-to-end 13× is
+the honest number for a single run; 25× is what you feel on the second one.
 
 ---
 
@@ -59,12 +106,26 @@ Speed is only interesting if the answers match. They do.
 
 | op | check | result |
 |---|---|---|
-| `cload` | pixel table vs reference | **exact** (all 2,563,532,430 pixels) |
+| `cload` | pixel table vs **cooler** | **byte-identical** (all 2,563,532,077 pixels, and again at 10 kb) |
 | `merge` | pixel table vs reference | **exact** |
 | `zoomify` | vs `cooler.coarsen_cooler` | **exact**; counts conserved at every level |
 | `balance` | vs `cooler.balance_cooler`, same tolerance | **0** mask disagreements; weights agree to **2.5e-6** (median; p99 3.4e-6) |
 | `balance` | 1.12 B-pixel cooler, both at default tolerance | **0** mask disagreements; median **8.1e-6** (p99 4.5e-5) |
 | `expected` | vs `cooltools.expected_cis` | **6.4e-16** — machine precision |
+
+### The benchmark found a bug
+
+Running `cload` head to head at this size is what surfaced it: rooler's pixel count was 353
+higher than cooler's, with total counts identical. `.pairs` coordinates are **1-based** (4DN
+spec, and cooler's default), but rooler was binning them as `pos / binsize` instead of
+`(pos-1) / binsize`. That shifts every read whose position is an exact multiple of the binsize
+into the next bin — about 1 read-end in `binsize`, so 0.4% at 256 bp — and a read at the very
+end of a chromosome spilled into the *next chromosome*.
+
+It had gone unnoticed because the earlier "pixel-exact" checks compared rooler against rooler
+(and against a prototype sharing the same convention). Comparing against cooler itself is what
+caught it. Fixed, with `--zero-based` for files that genuinely are 0-based; output is now
+byte-identical to cooler at both 10 kb and 256 bp.
 
 At *default* settings the balance weights differ by ~2.4e-4, purely because the two tools stop
 at different points: rooler's default is a scale-free criterion (`CV = std/mean < 1e-4`) rather

@@ -34,6 +34,12 @@ pub struct Bins {
     pub off_hi: Vec<i64>,   // one past the last bin of each chromosome
     pub nbins: i64,
     pub binsize: i64,
+    /// `.pairs` coordinates are 1-based per the 4DN spec, and that is what cooler assumes by
+    /// default, so a position P belongs in bin (P-1)/binsize. Binning it as P/binsize instead
+    /// shifts every read whose position is an exact multiple of the binsize into the next bin
+    /// (~1 read-end in `binsize`), and makes a read at the very end of a chromosome spill into
+    /// the next chromosome entirely. Set false for a genuinely 0-based file (`--zero-based`).
+    pub one_based: bool,
 }
 
 #[inline]
@@ -72,8 +78,9 @@ pub fn parse_line(line: &[u8], bins: &Bins, cache: &mut ChromCache) -> Result<Op
              else { let v = lookup(c1)?; cache.c1 = c1.to_vec(); cache.i1 = v; v };
     let i2 = if cache.i2 >= 0 && c2 == cache.c2.as_slice() { cache.i2 }
              else { let v = lookup(c2)?; cache.c2 = c2.to_vec(); cache.i2 = v; v };
-    let b1 = bins.off_lo[i1 as usize] + p1 / bins.binsize;
-    let b2 = bins.off_lo[i2 as usize] + p2 / bins.binsize;
+    let z = if bins.one_based { 1 } else { 0 };
+    let b1 = bins.off_lo[i1 as usize] + (p1 - z).max(0) / bins.binsize;
+    let b2 = bins.off_lo[i2 as usize] + (p2 - z).max(0) / bins.binsize;
     // out-of-range positions (bad chromsizes, malformed/non-numeric fields) would silently land
     // in the NEXT chromosome's bins — corrupt output, no symptom. Refuse the line instead.
     if b1 >= bins.off_hi[i1 as usize] {
@@ -165,8 +172,9 @@ fn worker(rx: Receiver<Vec<u8>>, bins: Arc<Bins>, cap: usize, tmpdir: Arc<String
     Ok((paths2, np))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn cload(pairs: &str, binsize: i64, out: &str, mem_gb: f64, nthreads: usize,
-             comp: Comp, tmpdir: &str, assembly: Option<&str>, log: bool) -> Result<u64> {
+             comp: Comp, tmpdir: &str, assembly: Option<&str>, one_based: bool, log: bool) -> Result<u64> {
     let t0 = std::time::Instant::now();
     // ".gz" -> parallel bgzip decode; "-" -> stdin; anything else -> plain text on disk
     let mut child = if pairs.ends_with(".gz") {
@@ -228,7 +236,7 @@ pub fn cload(pairs: &str, binsize: i64, out: &str, mem_gb: f64, nthreads: usize,
     let asm = crate::view::resolve_assembly(assembly, &chromsizes).ok_or_else(|| anyhow!(
         "refusing to create a cooler without a genome assembly: could not detect it from the chromsizes; pass --assembly <name>"))?;
     if log { eprintln!("  genome-assembly: {}", asm); }
-    let bins = Arc::new(Bins { cmap, off_lo, off_hi, nbins, binsize });
+    let bins = Arc::new(Bins { cmap, off_lo, off_hi, nbins, binsize, one_based });
 
     // --- spawn workers ---
     std::fs::create_dir_all(tmpdir)?;
@@ -437,7 +445,7 @@ mod tests {
         let mut cmap = HashMap::new();
         cmap.insert(b"chr1".to_vec(), 0i64);
         cmap.insert(b"chr2".to_vec(), 1i64);
-        Bins { cmap, off_lo: vec![0, 10], off_hi: vec![10, 20], nbins: 20, binsize: 100 }
+        Bins { cmap, off_lo: vec![0, 10], off_hi: vec![10, 20], nbins: 20, binsize: 100, one_based: false }
     }
 
     #[test]
@@ -480,6 +488,35 @@ mod tests {
         assert_eq!(parse_line(b"#comment", &b, &mut c).unwrap(), None);
         assert_eq!(parse_line(b"", &b, &mut c).unwrap(), None);
         assert_eq!(parse_line(b"r5\tchr1\t150", &b, &mut c).unwrap(), None);
+    }
+
+    /// `.pairs` is 1-based, so position P belongs in bin (P-1)/binsize. Getting this wrong
+    /// silently shifts ~1 read-end in `binsize` into the neighbouring bin and lets a read at
+    /// the end of a chromosome spill into the next one. Verified byte-identical to cooler.
+    #[test]
+    fn one_based_positions_bin_like_cooler() {
+        let mut b = bins3();          // 2 chroms x 1000bp at binsize 100 -> bins 0..9, 10..19
+        b.one_based = true;
+        let mut c = ChromCache::default();
+        let bin = |line: &[u8], b: &Bins, c: &mut ChromCache| {
+            parse_line(line, b, c).unwrap().map(|k| (k / b.nbins, k % b.nbins))
+        };
+        // pos 1..100 -> bin 0; 101..200 -> bin 1 (exact multiples stay in the LOWER bin)
+        assert_eq!(bin(b"r\tchr1\t1\tchr1\t1\t+\t-", &b, &mut c), Some((0, 0)));
+        assert_eq!(bin(b"r\tchr1\t100\tchr1\t100\t+\t-", &b, &mut c), Some((0, 0)));
+        assert_eq!(bin(b"r\tchr1\t101\tchr1\t101\t+\t-", &b, &mut c), Some((1, 1)));
+        assert_eq!(bin(b"r\tchr1\t200\tchr1\t200\t+\t-", &b, &mut c), Some((1, 1)));
+        // the last legal 1-based position is exactly the chromosome length: it must land in
+        // that chromosome's LAST bin, never in the next chromosome's first
+        assert_eq!(bin(b"r\tchr1\t1000\tchr1\t1000\t+\t-", &b, &mut c), Some((9, 9)));
+        assert_eq!(bin(b"r\tchr2\t1000\tchr2\t1000\t+\t-", &b, &mut c), Some((19, 19)));
+        // past the end is still refused
+        assert!(parse_line(b"r\tchr1\t1001\tchr1\t1\t+\t-", &b, &mut c).is_err());
+        // 0-based mode keeps the old convention (--zero-based)
+        let mut z = bins3(); z.one_based = false;
+        let mut c2 = ChromCache::default();
+        assert_eq!(bin(b"r\tchr1\t100\tchr1\t100\t+\t-", &z, &mut c2), Some((1, 1)));
+        assert_eq!(bin(b"r\tchr1\t0\tchr1\t0\t+\t-", &z, &mut c2), Some((0, 0)));
     }
 
     #[test]

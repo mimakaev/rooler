@@ -31,12 +31,14 @@ Speed, measured on the same machine against `cooler` 0.10.4 (details in
 
 | op | cooler 0.10.4 | rooler | speedup |
 |---|---|---|---|
+| `cload` — 2.61 B pairs → 256 bp | 3258 s | **114 s** | **29×** |
+| `balance` — 2.5 B pixels, 12.5 M bins | 670 s | **51 s** | **13×** |
+| `coarsen` — 2.5 B pixels, 3 levels | 1955 s | **460 s** | **4.3×** |
 | `cload` — 50 M pairs → 10 kb | 31.4 s | **1.2 s** | **26×** |
-| `balance` — genome-wide IC | 18.7 s | **1.2 s** | **16×** |
-| `balance` — 1.12 B-pixel cooler | 80.6 s | **12.0 s** | **6.7×** |
-| `zoomify` — 5 resolutions | 13.6 s | **3.7 s** | **3.7×** |
 
-Same inputs, same machine, same session, with matching output sizes and matching results.
+Same inputs, same machine, same session — and the same answers: `cload` output is
+**byte-identical to cooler's**, coarsened levels match pixel for pixel, and balance selects an
+identical bin mask with weights agreeing to ~1e-5.
 
 ## Install
 
@@ -123,10 +125,14 @@ substantially faster than the usual gzip path, so compatibility costs you nothin
 is limited by its algorithms, not by the codec. `--preset blosc:zstd:1` is available if you
 prefer, and rooler reads blosc coolers written by other tools.
 
-Validated against the reference implementations: `cload`, `merge` and `zoomify` are
-**pixel-exact**; `balance` picks the identical set of bins and its weights agree with
+Validated against the reference implementations: `cload` output is **byte-identical** to
+`cooler cload` (verified on all 2.56 billion pixels of a real micro-C file); `merge` and
+`zoomify` are pixel-exact; `balance` picks the identical set of bins and its weights agree with
 `cooler.balance_cooler` to **2.5e-6** at matched tolerance; `expected` matches
 `cooltools.expected_cis` to machine precision (6.4e-16).
+
+`.pairs` coordinates are read as **1-based**, per the 4DN spec and cooler's default; pass
+`--zero-based` for a file that genuinely is not.
 
 ## Tests
 

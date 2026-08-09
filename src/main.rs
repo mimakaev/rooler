@@ -33,6 +33,8 @@ enum Cmd {
         #[arg(long)] assembly: Option<String>,
         /// cooler compatibility: pixels per chunk; maps to a --mem budget (mutually exclusive with --mem)
         #[arg(long)] chunksize: Option<u64>,
+        /// treat pairs positions as 0-based (the .pairs spec, and the default here, is 1-based)
+        #[arg(long)] zero_based: bool,
     },
     /// Build a multi-resolution .mcool from a base .cool
     Zoomify {
@@ -90,10 +92,11 @@ fn main() -> Result<()> {
             let r = res.or_else(|| inputs[0].split("::").nth(1).map(|g| g.rsplit('/').next().unwrap().to_string()));
             merge::merge_coolers_parallel(&paths, r.as_deref(), &out, mem, threads, cooler::Comp::parse(&preset)?, assembly.as_deref(), true)?;
         }
-        Cmd::Cload { pairs, binsize, out, mem, threads, preset, assembly, chunksize } => {
+        Cmd::Cload { pairs, binsize, out, mem, threads, preset, assembly, chunksize, zero_based } => {
             let mem = resolve_mem(mem, chunksize, threads);
             let tmp = format!("{}.runs", out);
-            cload::cload(&pairs, binsize, &out, mem, threads, cooler::Comp::parse(&preset)?, &tmp, assembly.as_deref(), true)?;
+            cload::cload(&pairs, binsize, &out, mem, threads, cooler::Comp::parse(&preset)?, &tmp,
+                assembly.as_deref(), !zero_based, true)?;
         }
         Cmd::Zoomify { src, out, resolutions, preset, assembly, balance, threads } => {
             zoomify::zoomify_and_balance(&src, &out, resolutions, cooler::Comp::parse(&preset)?,

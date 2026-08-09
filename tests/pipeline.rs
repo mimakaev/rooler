@@ -115,7 +115,7 @@ fn full_pipeline_matches_oracles() -> Result<()> {
     let base = p("base.cool");
     let tmp = p("runs");
     let nnz = cload::cload(case.pairs.to_str().unwrap(), BINSIZE, &base, 0.001, 4,
-        Comp::parse("blosc:zstd:1")?, &tmp, None, false)?;
+        Comp::parse("blosc:zstd:1")?, &tmp, None, false, false)?;
     assert_eq!(nnz as usize, case.expect.len(), "cload nnz");
     let got = read_pixels(&base, "/")?;
     assert_matches_oracle(&got, &case.expect, 1, "cload");
@@ -278,7 +278,7 @@ fn zoomify_balance_covers_every_level() -> Result<()> {
     let p = |n: &str| d.join(n).to_str().unwrap().to_string();
     let base = p("base.cool");
     cload::cload(case.pairs.to_str().unwrap(), BINSIZE, &base, 0.01, 4,
-        Comp::parse("blosc:zstd:1")?, &p("runs"), None, false)?;
+        Comp::parse("blosc:zstd:1")?, &p("runs"), None, false, false)?;
     let mc = p("out.mcool");
     let levels = vec![BINSIZE, BINSIZE * 2, BINSIZE * 4];
     zoomify::zoomify_and_balance(&base, &mc, Some(levels.clone()), Comp::parse("blosc:zstd:1")?,
@@ -305,9 +305,9 @@ fn cload_is_deterministic_across_mem_and_threads() -> Result<()> {
     let src = case.pairs.to_str().unwrap();
 
     let a = p("a.cool");
-    cload::cload(src, BINSIZE, &a, 0.0005, 1, Comp::parse("none")?, &p("ra"), None, false)?;
+    cload::cload(src, BINSIZE, &a, 0.0005, 1, Comp::parse("none")?, &p("ra"), None, false, false)?;
     let b = p("b.cool");
-    cload::cload(src, BINSIZE, &b, 4.0, 8, Comp::parse("gzip1")?, &p("rb"), None, false)?;
+    cload::cload(src, BINSIZE, &b, 4.0, 8, Comp::parse("gzip1")?, &p("rb"), None, false, false)?;
 
     let (pa, pb) = (read_pixels(&a, "/")?, read_pixels(&b, "/")?);
     assert_eq!(pa, pb, "cload output depends on --mem/--threads");
@@ -327,18 +327,18 @@ fn ops_refuse_bad_input() -> Result<()> {
     let pairs = dir.join("weird.pairs");
     std::fs::write(&pairs, "#chromsize: scaffold_1 12345\nr\tscaffold_1\t1\tscaffold_1\t2\t+\t+\n")?;
     let e = cload::cload(pairs.to_str().unwrap(), 100, &p("w.cool"), 0.01, 1,
-        Comp::parse("none")?, &p("rw"), None, false).unwrap_err();
+        Comp::parse("none")?, &p("rw"), None, false, false).unwrap_err();
     assert!(e.to_string().contains("assembly"), "expected an assembly refusal, got: {}", e);
     // ... but an explicit assembly is accepted
     cload::cload(pairs.to_str().unwrap(), 100, &p("w.cool"), 0.01, 1,
-        Comp::parse("none")?, &p("rw2"), Some("myGenome"), false)?;
+        Comp::parse("none")?, &p("rw2"), Some("myGenome"), false, false)?;
     assert_eq!(rooler::cooler::read_meta(&p("w.cool"), None)?.assembly, "myGenome");
 
     // merging coolers with different bin layouts must error, not silently corrupt
     let pairs2 = dir.join("w2.pairs");
     std::fs::write(&pairs2, "#chromsize: scaffold_1 12345\n#chromsize: scaffold_2 999\nr\tscaffold_1\t1\tscaffold_1\t2\t+\t+\n")?;
     cload::cload(pairs2.to_str().unwrap(), 100, &p("w2.cool"), 0.01, 1,
-        Comp::parse("none")?, &p("rw3"), Some("myGenome"), false)?;
+        Comp::parse("none")?, &p("rw3"), Some("myGenome"), false, false)?;
     let e = merge::merge_coolers(&[p("w.cool"), p("w2.cool")], None, &p("bad.cool"), 0.01,
         Comp::parse("none")?, Some("myGenome"), false).unwrap_err();
     assert!(e.to_string().contains("merge:"), "expected a merge mismatch error, got: {}", e);
@@ -361,7 +361,7 @@ fn zoomify_resolution_lists_are_validated_and_flexible() -> Result<()> {
     let p = |n: &str| d.join(n).to_str().unwrap().to_string();
     let base = p("base.cool");
     cload::cload(case.pairs.to_str().unwrap(), BINSIZE, &base, 0.01, 2,
-        Comp::parse("none")?, &p("runs"), None, false)?;
+        Comp::parse("none")?, &p("runs"), None, false, false)?;
 
     // non-integer multiple of the base -> hard error, not a truncated factor
     let e = zoomify::zoomify(&base, &p("bad1.mcool"), Some(vec![BINSIZE, BINSIZE * 5 / 2]),

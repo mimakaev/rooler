@@ -7,6 +7,14 @@ where behavior was meant to be unchanged, and the 1.1 B-pixel gzip merge benchma
 performance regression).
 
 ### Fixed
+- **`.pairs` positions are now read as 1-based** (the 4DN spec, and cooler's default), i.e.
+  binned as `(pos-1)/binsize` rather than `pos/binsize`. The old convention shifted every read
+  whose position was an exact multiple of the binsize into the next bin (~1 read-end in
+  `binsize`; 0.4% at 256 bp) and let a read at the end of a chromosome spill into the next
+  chromosome. `cload` output is now **byte-identical to `cooler cload`** — verified on all
+  2,563,532,077 pixels of a real micro-C file and again at 10 kb. `--zero-based` opts out.
+  This was found by benchmarking against cooler at 2.5 B pixels; earlier "pixel-exact" checks
+  had compared rooler against itself.
 - **Thread-safety of the parallel gzip writer.** The raw `H5Dwrite_chunk` calls now run under
   the hdf5 crate's global lock. Previously, `merge --threads >1` (gzip is the default preset)
   had worker threads reading inputs through libhdf5 while the writer wrote chunks outside the
