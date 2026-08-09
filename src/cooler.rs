@@ -263,6 +263,88 @@ impl CoolWriter {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn comp_parse_accepts_valid_presets() {
+        assert!(matches!(Comp::parse("none").unwrap(), Comp::None));
+        assert!(matches!(Comp::parse("gzip").unwrap(), Comp::Gzip(4)));
+        assert!(matches!(Comp::parse("gzip4").unwrap(), Comp::Gzip(4)));
+        assert!(matches!(Comp::parse("gzip0").unwrap(), Comp::Gzip(0)));
+        assert!(matches!(Comp::parse("gzip9").unwrap(), Comp::Gzip(9)));
+        assert!(matches!(Comp::parse("blosc:zstd:1").unwrap(), Comp::BloscZstd(1)));
+        assert!(matches!(Comp::parse("blosc:lz4:5").unwrap(), Comp::BloscLz4(5)));
+        assert!(matches!(Comp::parse("blosc:zstd").unwrap(), Comp::BloscZstd(1)));
+    }
+
+    #[test]
+    fn comp_parse_rejects_typos_instead_of_falling_back() {
+        // the whole point: a typo must not silently produce a different codec
+        for bad in ["gizp4", "blosc:snappy:1", "gzip99", "gzip300", "zstd", "", "blosc:", "blosc:zstd:1:2"] {
+            assert!(Comp::parse(bad).is_err(), "{:?} should be rejected", bad);
+        }
+    }
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("rooler_test_{}_{}", tag, std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn append_rejects_out_of_order_blocks() {
+        let d = tmpdir("append");
+        let p = d.join("t.cool");
+        let names = vec!["chrA".to_string()];
+        let mut w = CoolWriter::create(p.to_str().unwrap(), &names, &[100], 10, 10, &[0, 10],
+            Comp::None, "test").unwrap();
+        w.append(&[0, 1, 5], &[0, 3, 5], &[1, 1, 1]).unwrap();
+        // going backwards in bin1 would silently corrupt the bin1_offset index
+        let e = w.append(&[4], &[9], &[1]).unwrap_err();
+        assert!(e.to_string().contains("non-decreasing"), "unexpected error: {}", e);
+        // continuing forward from the last bin1 is fine (blocks may share a bin1)
+        w.append(&[5, 6], &[7, 6], &[1, 1]).unwrap();
+        w.close().unwrap();
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn writer_roundtrips_pixels_and_indexes() {
+        let d = tmpdir("roundtrip");
+        let p = d.join("t.cool");
+        let names = vec!["chrA".to_string(), "chrB".to_string()];
+        // chrA: 4 bins (35bp @10), chrB: 2 bins (20bp @10)
+        let (b1, b2, c) = (vec![0i64, 0, 1, 4], vec![0i64, 3, 1, 5], vec![5i32, 2, 7, 3]);
+        {
+            let mut w = CoolWriter::create(p.to_str().unwrap(), &names, &[35, 20], 10, 6, &[0, 4, 6],
+                Comp::Gzip(1), "test").unwrap();
+            w.append(&b1[..3], &b2[..3], &c[..3]).unwrap();
+            w.append(&b1[3..], &b2[3..], &c[3..]).unwrap();
+            assert_eq!(w.nnz, 4);
+            w.close().unwrap();
+        }
+        let f = hdf5::File::open(p.to_str().unwrap()).unwrap();
+        let g = f.group("/").unwrap();
+        assert_eq!(g.dataset("pixels/bin1_id").unwrap().read_1d::<i64>().unwrap().to_vec(), b1);
+        assert_eq!(g.dataset("pixels/bin2_id").unwrap().read_1d::<i64>().unwrap().to_vec(), b2);
+        assert_eq!(g.dataset("pixels/count").unwrap().read_1d::<i32>().unwrap().to_vec(), c);
+        // bin1_offset must be a valid CSR row pointer over the pixels
+        let off = g.dataset("indexes/bin1_offset").unwrap().read_1d::<i64>().unwrap().to_vec();
+        assert_eq!(off, vec![0, 2, 3, 3, 3, 4, 4]);
+        assert!(off.windows(2).all(|w| w[0] <= w[1]), "bin1_offset must be non-decreasing");
+        assert_eq!(*off.last().unwrap(), 4);
+        // bins are built from chromsizes: chrA 0-10-20-30-35, chrB 0-10-20
+        assert_eq!(g.dataset("bins/start").unwrap().read_1d::<i32>().unwrap().to_vec(), vec![0, 10, 20, 30, 0, 10]);
+        assert_eq!(g.dataset("bins/end").unwrap().read_1d::<i32>().unwrap().to_vec(), vec![10, 20, 30, 35, 10, 20]);
+        assert_eq!(g.dataset("bins/chrom").unwrap().read_1d::<i32>().unwrap().to_vec(), vec![0, 0, 0, 0, 1, 1]);
+        assert_eq!(g.attr("nnz").unwrap().read_scalar::<i64>().unwrap(), 4);
+        drop(f);
+        std::fs::remove_dir_all(&d).ok();
+    }
+}
+
 fn write_chrom_codes(g: &Group, cids: &[i32]) -> Result<()> {
     // v1: plain int32 codes (cooler fetch/region use chrom_offset; enum fidelity is a TODO)
     g.new_dataset::<i32>().shape([cids.len()]).create("chrom")?.write(&arr1(cids))?;

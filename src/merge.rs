@@ -121,6 +121,83 @@ fn check_inputs_match(meta: &crate::cooler::Meta, paths: &[String], res: Option<
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// In-memory BlockSource: a list of (keys, counts) blocks, yielded in order.
+    struct VecSource(std::vec::IntoIter<(Vec<i64>, Vec<i64>)>);
+    impl VecSource {
+        fn new(blocks: Vec<(Vec<i64>, Vec<i64>)>) -> VecSource { VecSource(blocks.into_iter()) }
+    }
+    impl BlockSource for VecSource {
+        fn next(&mut self) -> Result<Option<(Vec<i64>, Vec<i64>)>> { Ok(self.0.next()) }
+    }
+
+    /// run merge_sources with a tiny emit block and collect the whole output
+    fn run(srcs: Vec<VecSource>, emit: usize) -> (Vec<i64>, Vec<i64>) {
+        let (mut k, mut c) = (Vec::new(), Vec::new());
+        let n = merge_sources(srcs, emit, |kk, cc| { k.extend_from_slice(kk); c.extend_from_slice(cc); Ok(()) }).unwrap();
+        assert_eq!(n as usize, k.len(), "returned count must equal emitted keys");
+        assert!(k.windows(2).all(|w| w[0] < w[1]), "output keys must be strictly increasing");
+        (k, c)
+    }
+
+    #[test]
+    fn merges_and_sums_overlapping_keys() {
+        let a = VecSource::new(vec![(vec![1, 3, 5], vec![1, 1, 1])]);
+        let b = VecSource::new(vec![(vec![3, 4], vec![10, 10])]);
+        let c = VecSource::new(vec![(vec![1, 5, 9], vec![2, 2, 2])]);
+        assert_eq!(run(vec![a, b, c], 2), (vec![1, 3, 4, 5, 9], vec![3, 11, 10, 3, 2]));
+    }
+
+    #[test]
+    fn drains_duplicate_key_runs_spanning_blocks() {
+        // the same key repeated *within* a source and *across* its block boundary
+        let a = VecSource::new(vec![
+            (vec![7, 7, 7], vec![1, 1, 1]),
+            (vec![7, 7], vec![1, 1]),
+            (vec![8], vec![5]),
+        ]);
+        let b = VecSource::new(vec![(vec![7], vec![100])]);
+        assert_eq!(run(vec![a, b], 4), (vec![7, 8], vec![105, 5]));
+    }
+
+    #[test]
+    fn handles_empty_and_degenerate_inputs() {
+        assert_eq!(run(Vec::<VecSource>::new(), 4), (vec![], vec![]));
+        assert_eq!(run(vec![VecSource::new(vec![])], 4), (vec![], vec![]));
+        // empty blocks interleaved with real ones must be skipped, not terminate the source
+        let a = VecSource::new(vec![(vec![], vec![]), (vec![2], vec![3]), (vec![], vec![]), (vec![4], vec![5])]);
+        assert_eq!(run(vec![a], 1), (vec![2, 4], vec![3, 5]));
+        let s = VecSource::new(vec![(vec![1, 2, 3], vec![1, 1, 1])]);
+        assert_eq!(run(vec![s], 100), (vec![1, 2, 3], vec![1, 1, 1]));
+    }
+
+    #[test]
+    fn emit_block_size_does_not_change_result() {
+        let mk = || vec![
+            VecSource::new(vec![(vec![1, 2, 2, 9], vec![1, 1, 1, 1])]),
+            VecSource::new(vec![(vec![2, 3], vec![5, 5]), (vec![9, 10], vec![1, 1])]),
+        ];
+        let want = (vec![1, 2, 3, 9, 10], vec![1, 7, 5, 2, 1]);
+        for emit in [1, 2, 3, 1000] {
+            assert_eq!(run(mk(), emit), want, "emit block {}", emit);
+        }
+    }
+
+    #[test]
+    fn clamps_counts_at_i32_max() {
+        let mut n = 0u64;
+        assert_eq!(clamp_count(5, &mut n), 5);
+        assert_eq!(clamp_count(i32::MAX as i64, &mut n), i32::MAX);
+        assert_eq!(n, 0, "exactly i32::MAX must not count as clamped");
+        assert_eq!(clamp_count(i32::MAX as i64 + 1, &mut n), i32::MAX);
+        assert_eq!(clamp_count(9_000_000_000, &mut n), i32::MAX);
+        assert_eq!(n, 2);
+    }
+}
+
 /// Ranged-parallel merge: partition bin1 into P count-balanced ranges (sliced from each input via
 /// bin1_offset), merge each range on its own thread, and stream range outputs to the writer IN ORDER
 /// via bounded channels (backpressure bounds RAM; no temp files). Falls back to serial for P<=1.

@@ -151,6 +151,45 @@ mod tests {
         assert_eq!(regs[0].end, 195471971);
     }
     #[test]
+    fn saccer3_arms_have_a_centromere_table() {
+        // regression: saccer3 defaulted to Arms but had no CEN table -> confusing refusal
+        let sizes = vec![("chrI".into(), 230218i64), ("chrXII".into(), 1078177)];
+        let (name, regs) = resolve("sacCer3", &sizes, None).unwrap();
+        assert_eq!(name, "arms");
+        assert_eq!(regs.len(), 4, "both chroms split into p/q");
+        let i_p = regs.iter().find(|r| r.name == "chrI_p").unwrap();
+        assert_eq!((i_p.start, i_p.end), (0, 151465));
+        let i_q = regs.iter().find(|r| r.name == "chrI_q").unwrap();
+        assert_eq!((i_q.start, i_q.end), (151465, 230218));
+        // every arm genome we default to must have a table, else the default is unusable
+        for g in ["hg38", "hg19", "saccer3"] {
+            assert!(centromeres(g).is_some(), "{} defaults to arms but has no CEN table", g);
+        }
+    }
+
+    #[test]
+    fn centromere_tables_are_sane() {
+        for (g, tbl) in [("hg38", HG38_CEN), ("hg19", HG19_CEN), ("saccer3", SACCER3_CEN)] {
+            for &(c, mid) in tbl {
+                assert!(mid > 0, "{} {} centromere must be positive", g, c);
+            }
+            let mut names: Vec<&str> = tbl.iter().map(|&(c, _)| c).collect();
+            names.sort_unstable();
+            let n = names.len();
+            names.dedup();
+            assert_eq!(names.len(), n, "{} has duplicate chrom entries", g);
+        }
+    }
+
+    #[test]
+    fn arms_clamp_centromere_to_chrom_length() {
+        // a truncated/test chrom shorter than its centromere must not produce an inverted region
+        let sizes = vec![("chr1".into(), 1000i64)];
+        let (_, regs) = resolve("hg38", &sizes, None).unwrap();
+        for r in &regs { assert!(r.start <= r.end, "region {} inverted", r.name); }
+    }
+
+    #[test]
     fn unknown_genome_refuses() {
         let sizes = vec![("scaffold_1".into(), 12345i64)];
         assert!(resolve("weirdbug", &sizes, None).is_err());

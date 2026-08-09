@@ -15,12 +15,12 @@ use std::sync::Arc;
 
 const SPILL_BLK: usize = 1_000_000; // keys per compressed spill block
 
-fn shuffle8(d: &[i64]) -> Vec<u8> {
+pub fn shuffle8(d: &[i64]) -> Vec<u8> {
     let n = d.len(); let mut o = vec![0u8; 8 * n];
     for i in 0..n { let b = d[i].to_le_bytes(); for p in 0..8 { o[p * n + i] = b[p]; } }
     o
 }
-fn unshuffle8(buf: &[u8], n: usize) -> Vec<i64> {
+pub fn unshuffle8(buf: &[u8], n: usize) -> Vec<i64> {
     (0..n).map(|i| { let mut b = [0u8; 8]; for p in 0..8 { b[p] = buf[p * n + i]; } i64::from_le_bytes(b) }).collect()
 }
 
@@ -68,6 +68,22 @@ pub fn parse_line(line: &[u8], bins: &Bins, cache: &mut ChromCache) -> Result<Op
     Ok(Some(lo * bins.nbins + hi))
 }
 
+/// Write sorted keys as compressed spill blocks: per block, delta + byte-shuffle + LZ4
+/// (~1.8 B/key vs 8 raw -> 4.5x less spill IO). Block layout: [n u32][clen u32][lz4 bytes].
+pub fn write_spill(w: &mut impl Write, sorted_keys: &[i64]) -> Result<()> {
+    for chunk in sorted_keys.chunks(SPILL_BLK) {
+        let n = chunk.len();
+        let mut d = vec![0i64; n];
+        d[0] = chunk[0];
+        for i in 1..n { d[i] = chunk[i] - chunk[i - 1]; }
+        let comp = compress(&shuffle8(&d));
+        w.write_all(&(n as u32).to_le_bytes())?;
+        w.write_all(&(comp.len() as u32).to_le_bytes())?;
+        w.write_all(&comp)?;
+    }
+    Ok(())
+}
+
 fn worker(rx: Receiver<Vec<u8>>, bins: Arc<Bins>, cap: usize, tmpdir: Arc<String>, wid: usize)
     -> Result<(Vec<String>, u64)> {
     let mut buf: Vec<i64> = Vec::with_capacity(cap);
@@ -75,22 +91,12 @@ fn worker(rx: Receiver<Vec<u8>>, bins: Arc<Bins>, cap: usize, tmpdir: Arc<String
     let mut np = 0u64;
     let mut seq = 0usize;
     let mut cache = ChromCache::default();
-    // compressed sorted-key runs: per block, delta + byte-shuffle + LZ4 (less spill IO)
     let spill = |buf: &mut Vec<i64>, seq: &mut usize, paths: &mut Vec<String>| -> Result<()> {
         if buf.is_empty() { return Ok(()); }
         buf.sort_unstable();
         let p = format!("{}/r{}_{}.kz", tmpdir, wid, seq);
         let mut w = BufWriter::new(std::fs::File::create(&p)?);
-        for chunk in buf.chunks(SPILL_BLK) {
-            let n = chunk.len();
-            let mut d = vec![0i64; n];
-            d[0] = chunk[0];
-            for i in 1..n { d[i] = chunk[i] - chunk[i - 1]; }
-            let comp = compress(&shuffle8(&d));
-            w.write_all(&(n as u32).to_le_bytes())?;
-            w.write_all(&(comp.len() as u32).to_le_bytes())?;
-            w.write_all(&comp)?;
-        }
+        write_spill(&mut w, buf)?;
         w.flush()?; paths.push(p); *seq += 1; buf.clear();
         Ok(())
     };
@@ -227,5 +233,101 @@ impl BlockSource for RunReader {
         let mut acc = 0i64;
         for i in 0..n { acc += d[i]; keys[i] = acc; }
         Ok(Some((keys, vec![1i64; n])))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bins3() -> Bins {
+        // 2 chroms of 1000bp at binsize 100 -> 10 bins each, nbins 20
+        let mut cmap = HashMap::new();
+        cmap.insert(b"chr1".to_vec(), 0i64);
+        cmap.insert(b"chr2".to_vec(), 1i64);
+        Bins { cmap, off_lo: vec![0, 10], nbins: 20, binsize: 100 }
+    }
+
+    #[test]
+    fn shuffle8_roundtrips() {
+        for v in [vec![0i64], vec![-1, 0, 1, i64::MAX, i64::MIN], (0..5000).map(|i| i * 7 - 99).collect()] {
+            let sh = shuffle8(&v);
+            assert_eq!(sh.len(), 8 * v.len());
+            assert_eq!(unshuffle8(&sh, v.len()), v);
+        }
+    }
+
+    #[test]
+    fn parse_line_basic() {
+        let b = bins3();
+        let mut c = ChromCache::default();
+        // chr1:150 (bin 1) x chr1:350 (bin 3) -> key 1*20+3
+        assert_eq!(parse_line(b"r1\tchr1\t150\tchr1\t350\t+\t+", &b, &mut c).unwrap(), Some(23));
+        // reversed order must be normalized to (lo,hi)
+        assert_eq!(parse_line(b"r2\tchr1\t350\tchr1\t150\t+\t+", &b, &mut c).unwrap(), Some(23));
+        // trans: chr1:50 (bin 0) x chr2:250 (bin 10+2=12)
+        assert_eq!(parse_line(b"r3\tchr1\t50\tchr2\t250\t+\t+", &b, &mut c).unwrap(), Some(12));
+        // no trailing fields after pos2 (pos2 runs to end of line)
+        assert_eq!(parse_line(b"r4\tchr1\t150\tchr1\t350", &b, &mut c).unwrap(), Some(23));
+        // comments/blank/short lines are skipped
+        assert_eq!(parse_line(b"#comment", &b, &mut c).unwrap(), None);
+        assert_eq!(parse_line(b"", &b, &mut c).unwrap(), None);
+        assert_eq!(parse_line(b"r5\tchr1\t150", &b, &mut c).unwrap(), None);
+    }
+
+    #[test]
+    fn parse_line_unknown_chrom_errors() {
+        let b = bins3();
+        let mut c = ChromCache::default();
+        let e = parse_line(b"r1\tchr1\t150\tchrBOGUS\t350\t+\t+", &b, &mut c).unwrap_err();
+        assert!(e.to_string().contains("chrBOGUS"), "error should name the chromosome: {}", e);
+        // an empty chrom name must not be silently accepted via the empty cache
+        assert!(parse_line(b"r2\t\t150\tchr1\t350\t+\t+", &b, &mut c).is_err());
+    }
+
+    #[test]
+    fn chrom_cache_survives_alternating_chroms() {
+        let b = bins3();
+        let mut c = ChromCache::default();
+        // alternate so the cache is repeatedly invalidated; results must stay correct
+        for _ in 0..4 {
+            assert_eq!(parse_line(b"r\tchr1\t50\tchr1\t50\t+\t+", &b, &mut c).unwrap(), Some(0));
+            assert_eq!(parse_line(b"r\tchr2\t50\tchr2\t50\t+\t+", &b, &mut c).unwrap(), Some(10 * 20 + 10));
+        }
+    }
+
+    #[test]
+    fn spill_roundtrips_across_block_boundaries() {
+        // more than 2 full SPILL_BLK blocks + a partial one
+        let n = 2 * SPILL_BLK + 12_345;
+        let mut keys: Vec<i64> = Vec::with_capacity(n);
+        let mut acc = 0i64;
+        let mut s = 7u64;
+        for _ in 0..n {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+            acc += (s >> 40) as i64 % 1000 + 1; // strictly increasing, varied deltas
+            keys.push(acc);
+        }
+        let dir = std::env::temp_dir().join(format!("rooler_spill_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("r.kz");
+        {
+            let mut w = BufWriter::new(std::fs::File::create(&path).unwrap());
+            write_spill(&mut w, &keys).unwrap();
+            w.flush().unwrap();
+        }
+        // spill must actually be compact (that is its whole purpose)
+        let sz = std::fs::metadata(&path).unwrap().len() as f64 / n as f64;
+        assert!(sz < 4.0, "spill should be well under 8 B/key, got {:.2}", sz);
+
+        let mut rr = RunReader::open(path.to_str().unwrap()).unwrap();
+        let mut got = Vec::with_capacity(n);
+        while let Some((k, c)) = rr.next().unwrap() {
+            assert!(c.iter().all(|&x| x == 1), "run counts are all 1");
+            assert_eq!(k.len(), c.len());
+            got.extend_from_slice(&k);
+        }
+        assert_eq!(got, keys);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

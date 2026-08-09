@@ -1,15 +1,6 @@
-mod cooler;
-mod merge;
-mod cload;
-mod zoomify;
-mod balance;
-mod scratch;
-mod scratch_tiled;
-mod expected;
-#[allow(dead_code)]
-mod view;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use rooler::{balance, cload, cooler, expected, merge, zoomify};
 
 #[derive(Parser)]
 #[command(name = "rooler", about = "Fast out-of-core cooler engine")]

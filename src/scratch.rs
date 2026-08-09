@@ -5,7 +5,7 @@ use anyhow::Result;
 use lz4_flex::block::{compress, decompress};
 use rayon::prelude::*;
 
-pub(crate) fn shuffle4(src: &[u32]) -> Vec<u8> {
+pub fn shuffle4(src: &[u32]) -> Vec<u8> {
     let n = src.len();
     let mut o = vec![0u8; 4 * n];
     for i in 0..n {
@@ -14,7 +14,7 @@ pub(crate) fn shuffle4(src: &[u32]) -> Vec<u8> {
     }
     o
 }
-pub(crate) fn unshuffle4(buf: &[u8], n: usize, out: &mut [u32]) {
+pub fn unshuffle4(buf: &[u8], n: usize, out: &mut [u32]) {
     // safety: caller guarantees buf.len() >= 4*n and out.len() >= n
     for i in 0..n { unsafe {
         *out.get_unchecked_mut(i) = u32::from_le_bytes([
@@ -23,7 +23,7 @@ pub(crate) fn unshuffle4(buf: &[u8], n: usize, out: &mut [u32]) {
     }}
 }
 // count codec: [u32 nexc][u32 idx*nexc][u32 val*nexc][lz4(u8 base)]  (base_len = npix known by caller)
-pub(crate) fn enc_count(cn: &[i32]) -> Vec<u8> {
+pub fn enc_count(cn: &[i32]) -> Vec<u8> {
     let n = cn.len();
     let mut idx = Vec::new(); let mut val = Vec::new();
     let mut base = vec![0u8; n];
@@ -39,7 +39,7 @@ pub(crate) fn enc_count(cn: &[i32]) -> Vec<u8> {
     out.extend_from_slice(&comp);
     out
 }
-pub(crate) fn dec_count(buf: &[u8], npix: usize, out: &mut [i32]) {
+pub fn dec_count(buf: &[u8], npix: usize, out: &mut [i32]) {
     let nexc = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
     let mut p = 4;
     let idx_end = p + 4 * nexc; let val_end = idx_end + 4 * nexc;
@@ -240,4 +240,75 @@ impl SpMV for Scratch {
     fn comp_bytes(&self) -> usize { Scratch::comp_bytes(self) }
     fn marginals(&self, ndiag: i64) -> (Vec<f64>, Vec<f64>) { Scratch::marginals(self, ndiag) }
     fn spmv(&self, v: &[f64], ndiag: i64) -> Vec<f64> { Scratch::spmv(self, v, ndiag) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// deterministic pseudo-random source (no rand dependency; reproducible failures)
+    pub struct Lcg(pub u64);
+    impl Lcg {
+        pub fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 >> 11
+        }
+        pub fn below(&mut self, n: u64) -> u64 { self.next() % n }
+    }
+
+    fn roundtrip4(v: &[u32]) {
+        let sh = shuffle4(v);
+        assert_eq!(sh.len(), 4 * v.len());
+        let mut out = vec![0u32; v.len()];
+        unshuffle4(&sh, v.len(), &mut out);
+        assert_eq!(out, v, "shuffle4 round-trip");
+        // and through LZ4, the way the scratch actually stores it
+        let comp = lz4_flex::block::compress(&sh);
+        let raw = lz4_flex::block::decompress(&comp, 4 * v.len()).unwrap();
+        let mut out2 = vec![0u32; v.len()];
+        unshuffle4(&raw, v.len(), &mut out2);
+        assert_eq!(out2, v, "shuffle4+lz4 round-trip");
+    }
+
+    #[test]
+    fn shuffle4_roundtrips() {
+        roundtrip4(&[7]);
+        roundtrip4(&[0, 1, 255, 256, 65535, 65536, u32::MAX]);
+        let mut g = Lcg(12345);
+        let v: Vec<u32> = (0..10_000).map(|_| g.next() as u32).collect();
+        roundtrip4(&v);
+        // small deltas (the realistic within-row-delta case) must compress
+        let d: Vec<u32> = (0..10_000).map(|_| g.below(64) as u32).collect();
+        roundtrip4(&d);
+        assert!(lz4_flex::block::compress(&shuffle4(&d)).len() < 4 * d.len() / 2,
+            "byte-shuffled small deltas should compress >2x");
+    }
+
+    fn roundtrip_count(v: &[i32]) {
+        let enc = enc_count(v);
+        let mut out = vec![0i32; v.len()];
+        dec_count(&enc, v.len(), &mut out);
+        assert_eq!(out, v, "count codec round-trip");
+    }
+
+    #[test]
+    fn count_codec_roundtrips() {
+        roundtrip_count(&[1]);
+        // the u8-base / u32-exception boundary
+        roundtrip_count(&[0, 1, 254, 255, 256, 257, 1000, i32::MAX]);
+        roundtrip_count(&vec![3i32; 5000]);                       // all small
+        roundtrip_count(&vec![100_000i32; 500]);                  // all exceptions
+        let mut g = Lcg(999);
+        // realistic mix: mostly small, ~1% exceptions
+        let v: Vec<i32> = (0..20_000)
+            .map(|_| if g.below(100) == 0 { 256 + g.below(1_000_000) as i32 } else { g.below(256) as i32 })
+            .collect();
+        roundtrip_count(&v);
+    }
+
+    #[test]
+    fn count_codec_is_compact_for_small_counts() {
+        let v = vec![1i32; 100_000];
+        assert!(enc_count(&v).len() < 100_000 / 10, "all-ones counts should compress >10x");
+    }
 }
