@@ -378,8 +378,10 @@ fn zoomify_resolution_lists_are_validated_and_flexible() -> Result<()> {
     let d = &case.dir;
     let p = |n: &str| d.join(n).to_str().unwrap().to_string();
     let base = p("base.cool");
+    // gzip base: coarsening from it exercises the parallel direct-chunk READ path against the
+    // oracle; the "none"-preset outputs below exercise the serial fallback level-to-level
     cload::cload(case.pairs.to_str().unwrap(), BINSIZE, &base, 0.01, 2,
-        Comp::parse("none")?, &p("runs"), None, false, false)?;
+        Comp::parse("gzip1")?, &p("runs"), None, false, false)?;
 
     // non-integer multiple of the base -> hard error, not a truncated factor
     let e = zoomify::zoomify(&base, &p("bad1.mcool"), Some(vec![BINSIZE, BINSIZE * 5 / 2]),

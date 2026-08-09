@@ -3,6 +3,12 @@
 ## Unreleased
 
 ### Added
+- **Parallel direct-chunk gzip reader** (`parread.rs`, the mirror of the writer): raw chunks
+  are fetched with `H5Dread_chunk` and inflated + unshuffled on rayon threads, falling back to
+  the ordinary serial read for non-gzip layouts. Shared by every op that streams a pixel table
+  — zoomify/coarsen, expected, repack. The 2.5 B-pixel 3-level coarsen benchmark drops
+  **461 s → 336 s** (each coarsen level ~1.45×; outputs verified byte-identical across all
+  7.36 B pixels). Coarsen is now bound by its single-threaded aggregation loop, not the read.
 - **Expected is computed by default whenever weights are written** — after `balance`, after
   each level of `zoomify --balance`, and in `repack`. One O(nnz) pass + FFT, with the
   per-organism default view (arms for hg38/hg19/sacCer3, whole chromosomes for mm10/mm39/dm6/

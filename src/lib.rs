@@ -9,6 +9,7 @@ pub mod cload;
 pub mod cooler;
 pub mod expected;
 pub mod merge;
+pub mod parread;
 pub mod parwrite;
 pub mod repack;
 pub mod scratch;

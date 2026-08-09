@@ -20,21 +20,9 @@ fn read_root_meta(path: &str) -> Result<(Vec<String>, Vec<i64>, i64, String)> {
 }
 
 /// Stream all pixels of `grp/pixels` in blocks, calling `f(bin1, bin2, count)`.
-fn stream_pixels(g: &hdf5::Group, block: usize, mut f: impl FnMut(&[i64], &[i64], &[i32]) -> Result<()>) -> Result<()> {
-    let b1 = g.dataset("pixels/bin1_id")?;
-    let b2 = g.dataset("pixels/bin2_id")?;
-    let cn = g.dataset("pixels/count")?;
-    let n = cn.shape()[0];
-    let mut pos = 0;
-    while pos < n {
-        let hi = (pos + block).min(n);
-        let a = b1.read_slice_1d::<i64, _>(pos..hi)?;
-        let b = b2.read_slice_1d::<i64, _>(pos..hi)?;
-        let c = cn.read_slice_1d::<i32, _>(pos..hi)?;
-        f(a.as_slice().unwrap(), b.as_slice().unwrap(), c.as_slice().unwrap())?;
-        pos = hi;
-    }
-    Ok(())
+/// Chunk decompression runs on rayon threads for gzip columns (see parread.rs).
+fn stream_pixels(g: &hdf5::Group, block: usize, f: impl FnMut(&[i64], &[i64], &[i32]) -> Result<()>) -> Result<()> {
+    crate::parread::stream_pixels(g, block, f)
 }
 
 struct RowAgg {

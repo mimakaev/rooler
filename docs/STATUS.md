@@ -29,7 +29,7 @@ volume), not an architectural one. See `PLAN_LOG.md`.
 "No mystery coolers" (assembly required) enforced everywhere.
 
 ## Tests
-`cargo test --release` — **44 tests, ~0.6s**, no python/network/fixtures.
+`cargo test --release` — **49 tests, ~0.7s**, no python/network/fixtures.
 - Unit: codecs (bin2-delta shuffle+LZ4, u8+exception counts, spill runs incl. ranged readers),
   k-way merge semantics, pairs parsing, coarsening bin map, genome/BED views, cooler writer
   (round-trip, index validity, append order, preset parsing), parallel-gzip direct chunks.
@@ -89,13 +89,14 @@ Bugs caught by the new tests before they reached data:
 
 ## Suggested next steps
 1. Run the full distiller chain against rooler as a drop-in and fix whatever friction appears.
-2. **Coarsen (zoomify) is read+aggregate bound, not write bound**: the write side is the
-   parallel gzip packer, but the read side is HDF5's *single-threaded* inflate plus a
-   single-threaded map/RowAgg loop (~17 Mpix/s/level at the 2.5B benchmark). Two proven-shape
-   levers, unimplemented: (a) ranged-parallel coarsen — partition bin1 at coarse-row
-   boundaries, aggregate ranges on threads, drain in order to the writer (exactly the
-   merge/cload phase-B pattern); (b) a direct-chunk *reader* (H5Dread_chunk + libdeflater on
-   rayon threads — the mirror of parwrite.rs) to break the serial inflate. A "one giant tree
+2. **Coarsen: lever (b), the parallel direct-chunk reader, is DONE** (parread.rs, wired into
+   zoomify/expected/repack): 2.5B-pixel 3-level coarsen 461s -> 336s, all levels byte-identical
+   to the serial-read output. Each coarsen level is now bound by the single-threaded map+RowAgg
+   aggregation loop (~25 Mpix/s), not the read. Remaining lever, unimplemented: (a)
+   ranged-parallel coarsen — partition bin1 at coarse-row boundaries, aggregate ranges on
+   threads, drain in order to the writer (exactly the merge/cload phase-B pattern). Balance's
+   scratch build and merge's CoolerPix cursors still read via the serial path and could adopt
+   ChunkStream later (smaller wins: build is 28-38s at 2.5B, merge is near the read floor). A "one giant tree
    of all levels" pass was considered and rejected: the cascade already reads each level once
    and chains level-to-level; at depth the levels barely shrink, so every level's write cost
    is irreducible and the tree only adds HDF5 chunk-interleaving complexity.

@@ -51,7 +51,7 @@ Against `cooler` 0.10.4 on the same machine and inputs (details in
 |---|---|---|---|
 | `cload` — 2.61 B pairs → 256 bp | 3258 s | **114 s** | **29×** |
 | `balance` — 2.5 B pixels, 12.5 M bins | 670 s | **51 s** | **13×** |
-| `coarsen` — 2.5 B pixels, 3 levels | 1955 s | **460 s** | **4.3×** |
+| `coarsen` — 2.5 B pixels, 3 levels | 1955 s | **336 s** | **5.8×** |
 | `cload` — 50 M pairs → 10 kb | 31.4 s | **1.2 s** | **26×** |
 
 ## Install

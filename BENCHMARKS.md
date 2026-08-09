@@ -61,7 +61,7 @@ both tools at their own defaults, i.e. what you would actually type.
 |---|---|---|---|
 | `balance` (genome-wide IC, 12.5 M bins) | 670 s | **88 s** | **7.6×** |
 | `balance` with `--block 65536` | 670 s | **51 s** | **13×** |
-| `coarsen` 256 → 512 → 1024 → 2048 | 1955 s | **460 s** | **4.3×** |
+| `coarsen` 256 → 512 → 1024 → 2048 | 1955 s | **336 s** | **5.8×** |
 | `cload` 2.61 B pairs → 256 bp | 3258 s (54 min) | **114 s** | **29×** |
 
 **The results are the same results.** `cload` output is **byte-identical to cooler's** — all

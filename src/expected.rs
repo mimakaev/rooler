@@ -90,18 +90,8 @@ fn log_smooth_pair(xs: &[f64], sum: &[f64], nval: &[f64]) -> (Vec<f64>, Vec<f64>
 }
 
 fn stream_pixels(g: &hdf5::Group, block: usize, mut f: impl FnMut(&[i64], &[i64], &[i32])) -> Result<()> {
-    let (b1, b2, cn) = (g.dataset("pixels/bin1_id")?, g.dataset("pixels/bin2_id")?, g.dataset("pixels/count")?);
-    let n = cn.shape()[0];
-    let mut pos = 0;
-    while pos < n {
-        let hi = (pos + block).min(n);
-        let a = b1.read_slice_1d::<i64, _>(pos..hi)?;
-        let b = b2.read_slice_1d::<i64, _>(pos..hi)?;
-        let c = cn.read_slice_1d::<i32, _>(pos..hi)?;
-        f(a.as_slice().unwrap(), b.as_slice().unwrap(), c.as_slice().unwrap());
-        pos = hi;
-    }
-    Ok(())
+    // parallel chunk decompression for gzip columns; serial fallback otherwise (parread.rs)
+    crate::parread::stream_pixels(g, block, |a, b, c| { f(a, b, c); Ok(()) })
 }
 
 /// Default-on path (balance/zoomify/repack): compute expected with the per-organism default

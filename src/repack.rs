@@ -79,19 +79,8 @@ pub fn repack(src: &str, o: RepackOpts, log: bool) -> Result<()> {
             let sg = if group == "/" { sf.group("/")? } else { sf.group(&group)? };
             let mut w = CoolWriter::create_in(&f, &group, &meta.names, &meta.lengths, meta.binsize,
                 meta.nbins, &meta.chrom_offset, o.comp, &asm)?;
-            let (b1d, b2d, cnd) = (sg.dataset("pixels/bin1_id")?, sg.dataset("pixels/bin2_id")?,
-                                   sg.dataset("pixels/count")?);
-            let n = cnd.shape()[0];
-            let block = 1 << 22;
-            let mut pos = 0usize;
-            while pos < n {
-                let hi = (pos + block).min(n);
-                let a = b1d.read_slice_1d::<i64, _>(pos..hi)?;
-                let b = b2d.read_slice_1d::<i64, _>(pos..hi)?;
-                let c = cnd.read_slice_1d::<i32, _>(pos..hi)?;
-                w.append(a.as_slice().unwrap(), b.as_slice().unwrap(), c.as_slice().unwrap())?;
-                pos = hi;
-            }
+            crate::parread::stream_pixels(&sg, 1 << 22, |a, b, c| w.append(a, b, c))?;
+            let n = w.nnz;
             w.close()?;
             let dg = if group == "/" { f.group("/")? } else { f.group(&group)? };
             had_weight[ri] = copy_weight(&sg, &dg)?;
