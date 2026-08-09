@@ -142,3 +142,28 @@ pairs are uniform and so delta-code poorly. Real spill was 1.87 B/key.)
   budget still allowed the full 8 parallel ranges. At 1M blocks the same budget would have
   allowed only 6.
 - RAM is bounded by `--mem`, not by the data: 100B pairs and 48M bins ran in 30 GB.
+
+### zoomify at 64bp scale (same run)
+`rooler zoomify mega64.cool mega64.mcool --resolutions 64,128,256,512,1024`, streaming, RSS ~8 GB:
+
+| level | bins | pixels | cumulative time |
+|---|---|---|---|
+| 64 bp (base copy) | 48,254,229 | 81,477,686,796 | 1917s |
+| 128 bp | 24,127,123 | 73,965,326,303 | 5601s |
+| 256 bp | 12,063,568 | 66,268,934,613 | 9135s |
+| 512 bp, 1024 bp | — | — | still building when this was written |
+
+Note how little the pixel count drops when coarsening (81.5B -> 74.0B -> 66.3B): at this depth
+and resolution the matrix is so sparse that most pixels stay distinct, so each coarser level
+costs nearly as much as the last. That is a property of the data, not of the implementation.
+
+### Verification
+The finished 64bp cooler opens in python `cooler` (`nnz=81477686796, binsize=64`, 24 chroms) and
+`clr.matrix().fetch("chr1:0-500,000")` returns a correct, symmetric 7813x7813 block.
+
+### Verdict
+The 64bp claim holds: **100B pairs -> an 81.5B-pixel, 48.3M-bin cooler and a multi-resolution
+mcool, entirely out of core, with a 29.8 GB peak** (`--mem 32`), on a machine where the data is
+~30x larger than RAM. 300B was not attempted because it needs ~1.18 TB of a 1.20 TB volume —
+a **disk** limit on this box, not an architectural one; the run is linear in pairs, so 300B
+would take ~3x the time and ~3x the space.

@@ -16,8 +16,16 @@ sizing data, `../GZIP_PARALLEL_FINDINGS.md` the parallel-gzip study that P3 impl
 | **write path** | blosc:zstd:1 (default) or **parallel direct-chunk gzip** (`H5Dwrite_chunk` + libdeflater) | pixel-identical to serial gzip; plain SHUFFLE+DEFLATE, no plugins needed | gzip **3.8× faster** and 4.2% smaller than before |
 | **Python read API** | `rooler.open()`, `raw()/balanced()`, cooler-compat `matrix()/bins()/pixels()` | exact vs cooler; cooltools runs natively on the files | — |
 
-Scale proof: **megacooler** = 10 ENCODE files (~40B pairs) → 26.3B-pixel 53GB cooler @256bp in
-~63 min, balanced at 70GB peak RSS. "No mystery coolers" (assembly required) enforced everywhere.
+Scale proofs (real data): **megacooler** = 10 ENCODE files (~40B pairs) → 26.3B-pixel 53GB
+cooler @256bp in ~63 min, balanced at 70GB peak RSS.
+
+Scale proof (synthetic, 64bp): **100,000,000,000 pairs → 81,477,686,796 pixels over 48,254,229
+bins at 64 bp** in 1h55m (`--mem 32`), **peak RSS 29.8 GB** — data ~30× larger than RAM. The
+mcool cascade (64→128→256→…) then streams at ~8 GB RSS. The 64bp cooler opens in python
+`cooler` and fetches correctly. 300B pairs is a *disk* limit on this box (~1.18 TB of a 1.20 TB
+volume), not an architectural one. See `PLAN_LOG.md`.
+
+"No mystery coolers" (assembly required) enforced everywhere.
 
 ## Tests
 `cargo test --release` — **39 tests, ~0.6s**, no python/network/fixtures.
