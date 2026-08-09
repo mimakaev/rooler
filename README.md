@@ -186,6 +186,14 @@ is noisy at large separations, where few pixel pairs contribute, so the smoothed
 analyses actually want: `r.expected()` and `r.ooe()` both default to it, exactly as
 `cooltools.expected_cis` does, and `column=` selects another.
 
+## Limitations
+
+Only the core options have been ported. 
+
+* No asymmetric coolers
+* No trans-only or cis-only balancing
+
+
 ## Validation
 
 Against the reference implementations: `cload` output is identical to `cooler cload`
