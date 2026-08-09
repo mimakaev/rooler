@@ -26,8 +26,8 @@ rooler's answer is engineering every layer of the pipeline for that scale:
 - **Truly streaming, explicitly algorithmic ops.** Each operation is implemented as the
   algorithm it claims to be — merge is a k-way merge, coarsen is a streaming accumulation —
   not a chunk-sort in disguise. Rust kernels work in place, without the memcopies that
-  numpy-based chunking cannot avoid. Pixels are processed as they stream past, so `--mem` is a
-  real budget rather than a hint, and no op ever holds the matrix.
+  numpy-based chunking cannot avoid. Pixels are processed as they stream past. `--mem` options
+  controls total memory budget for buffers, chunks, etc.
 - **Compact custom intermediates.** Spill runs and scratch use purpose-built compressed binary
   formats (delta + byte-shuffle + LZ4), ~4× smaller than raw and fast enough to decode inside
   the compute loop.
