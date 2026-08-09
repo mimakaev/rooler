@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+Repository prepared for sharing: development scaffolding (`PLAN.md`, `PLAN_LOG.md`,
+`PROGRESS.md`, `RUN_PLAN.md`, `STATUS.md`), one-off experiment scripts and a stale compression
+example are gone; the benchmark scripts no longer hardcode absolute paths. Added
+**`docs/VALIDATION.md`** — a precise record of what has been checked against cooler/cooltools,
+what is covered only by the test suite, what has merely been run at scale, and what is
+untested. `docs/MEMORY.md` re-measured against the current engine. Removed an unverified claim
+of HiGlass compatibility from the README: the files are ordinary coolers, but only `cooler`,
+`cooltools` and `h5py` have actually been tested. CI now runs the Python accessor suite against
+real cooler, not just an import check.
+
+Also fixed while tidying: the parallel reader's fast path assumed 8-byte bin ids and 4-byte
+counts without checking, so a cooler written elsewhere with int32 bin ids or int64 counts would
+have been reinterpreted at the wrong width and read as garbage. It now verifies the stored
+element sizes and falls back to the serial path, which converts dtypes properly.
+
 ### Added
 - **Parallel direct-chunk gzip reader** (`parread.rs`, the mirror of the writer): raw chunks
   are fetched with `H5Dread_chunk` and inflated + unshuffled on rayon threads, falling back to

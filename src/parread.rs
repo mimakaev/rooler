@@ -53,6 +53,8 @@ impl ChunkStream {
 
     pub fn n_elems(&self) -> usize { self.n }
     pub fn chunk_elems(&self) -> usize { self.chunk }
+    /// Bytes per stored element, as the file declares it.
+    pub fn elem_size(&self) -> usize { self.esize }
     pub fn done(&self) -> bool { self.next >= self.nchunks }
 
     /// Fetch the raw stored bytes of up to `k` chunks (HDF5 calls, this thread, global lock).
@@ -128,11 +130,15 @@ pub fn stream_pixels(
     let b1d = g.dataset("pixels/bin1_id")?;
     let b2d = g.dataset("pixels/bin2_id")?;
     let cnd = g.dataset("pixels/count")?;
-    // fast path only when the columns are chunk-aligned with each other, so batches line up
+    // Fast path only when the columns are chunk-aligned with each other (so batches line up)
+    // AND stored at the widths the decoders below assume. A cooler written elsewhere may use
+    // int32 bin ids or int64 counts; reinterpreting those would silently corrupt the values, so
+    // anything unexpected falls back to the serial path, which converts dtypes properly.
     let fast = match (ChunkStream::open(b1d.clone())?, ChunkStream::open(b2d.clone())?, ChunkStream::open(cnd.clone())?) {
         (Some(a), Some(b), Some(c))
             if a.chunk_elems() == b.chunk_elems() && a.chunk_elems() == c.chunk_elems()
-                && a.n_elems() == b.n_elems() && a.n_elems() == c.n_elems() => Some((a, b, c)),
+                && a.n_elems() == b.n_elems() && a.n_elems() == c.n_elems()
+                && a.elem_size() == 8 && b.elem_size() == 8 && c.elem_size() == 4 => Some((a, b, c)),
         _ => None,
     };
     let Some((mut s1, mut s2, mut sc)) = fast else {

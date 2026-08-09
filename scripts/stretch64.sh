@@ -4,7 +4,7 @@
 # Streams pairs from the generator straight into cload (nothing is ever stored as text).
 set -u
 N=${1:-100000000000}
-OUT=${2:-/workspace/scratch_bench/mega64}
+OUT=${2:?usage: stretch64.sh <npairs> <outdir> [mem_gb] [threads]}
 MEM=${3:-32}
 THREADS=${4:-8}
 BIN=$(dirname "$0")/../target/release

@@ -7,8 +7,8 @@ PAIRS=${1:?pairs.gz}
 W=${2:?workdir}
 NP=${3:-8}
 BIN=$(cd "$(dirname "$0")/.." && pwd)/target/release
-PY=/workspace/.venv/bin/python
-COOLER=/workspace/.venv/bin/cooler
+COOLER=${COOLER:-$(command -v cooler)}
+[ -x "$COOLER" ] || { echo "need cooler on PATH (or COOLER=/path/to/cooler)"; exit 1; }
 mkdir -p "$W"
 
 t() { # t <label...> -- <cmd...>
@@ -53,7 +53,7 @@ echo "# done"
 
 # --- medium-scale balance only (a 1.1B-pixel, 64k-bin 50kb cooler). Deliberately NOT the
 # --- 2.5B/12.5M-bin or 81B-pixel coolers: cooler balance there would run for hours.
-MED=${MED:-/workspace/scratch_bench/e2e/base.cool}
+MED=${MED:-}   # optional: a larger cooler for a second balance comparison
 if [ -f "$MED" ]; then
   cp "$MED" "$W/med_r.cool"; cp "$MED" "$W/med_c.cool"
   echo "# medium balance input: $MED"

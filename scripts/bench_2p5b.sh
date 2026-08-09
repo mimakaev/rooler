@@ -4,16 +4,18 @@
 # tools on identical inputs, at each tool's own defaults (i.e. what a user actually types).
 #   scripts/bench_2p5b.sh <workdir>
 set -u
-W=${1:-/workspace/scratch_bench/b25}
-SRC=${SRC:-/workspace/scratch_bench/enc514_256.cool}          # 2,563,532,430 pixels, 12,537,161 bins
-PAIRS=${PAIRS:-/workspace/encode_hic_pairs/ENCFF514KZU.pairs.gz}
-CHROMS=${CHROMS:-/workspace/scratch_bench/bench/chrom.sizes}
+W=${1:?usage: bench_2p5b.sh <workdir>}
+SRC=${SRC:?set SRC=<cooler>}          # the ~2.5 B-pixel, 12.5 M-bin cooler at 256 bp
+PAIRS=${PAIRS:?set PAIRS=<pairs.gz>}  # the pairs file SRC was built from
+CHROMS=${CHROMS:-$W/chrom.sizes}      # derived from the pairs header if absent
 NP=${NP:-8}
 BIN=$(cd "$(dirname "$0")/.." && pwd)/target/release
-COOLER=/workspace/.venv/bin/cooler
-# cooler's worker processes need this to read blosc-compressed coolers at all
-export HDF5_PLUGIN_PATH=/workspace/.venv/lib/python3.12/site-packages/hdf5plugin/plugins
+COOLER=${COOLER:-$(command -v cooler)}
+# cooler's workers need this only if SRC is blosc-compressed; harmless otherwise
+[ -n "${HDF5_PLUGIN_PATH:-}" ] || export HDF5_PLUGIN_PATH=$(python -c \
+  'import hdf5plugin,os;print(os.path.join(os.path.dirname(hdf5plugin.__file__),"plugins"))' 2>/dev/null || echo "")
 mkdir -p "$W"
+[ -s "$CHROMS" ] || bgzip -dc "$PAIRS" | sed -n 's/^#chromsize: \([^ ]*\) \(.*\)/\1\t\2/p' > "$CHROMS"
 
 t() { # t <label...> -- <cmd...>
   local label=(); while [ "$1" != "--" ]; do label+=("$1"); shift; done; shift

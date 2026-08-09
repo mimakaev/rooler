@@ -12,8 +12,8 @@ CLI — the distiller-relevant pipeline `pairs → cload → merge → zoomify �
 scale modern micro-C has reached: tens to hundreds of billions of contacts, at 64–256 bp
 resolution.
 
-It writes ordinary **cooler files**. `cooler`, `cooltools`, HiGlass and everything else in that
-ecosystem read rooler output directly, with no plugins and no conversion step.
+It writes ordinary **cooler files** — `cooler` and `cooltools` read rooler output directly, with
+no plugins and no conversion step.
 
 ## Why
 
@@ -170,8 +170,10 @@ whole chromosomes where they are not (mouse, fly, worm).
 ## Compatibility
 
 rooler writes ordinary cooler files: gzip-compressed with the same shuffle+deflate pipeline
-cooler itself uses, so every HDF5 reader on earth opens them with no filter plugins and no
-conversion — `cooler`, `cooltools`, HiGlass, plain `h5py`. 
+cooler itself uses, so any HDF5 reader opens them with no filter plugins and no conversion.
+`cooler`, `cooltools` and `h5py` are tested against directly (see
+[docs/VALIDATION.md](docs/VALIDATION.md)); other consumers of the format should work but have
+not been tried. 
 
 `.pairs` coordinates are read as **1-based**, per the 4DN spec and cooler's default; pass
 `--zero-based` for a file that genuinely is not.
@@ -243,9 +245,10 @@ Working: all five ops, the Python read API, assembly enforcement. Known limits:
 
 ## Development
 
-`docs/` holds the development record: `STATUS.md` (current state and review findings),
-`PLAN.md` / `PLAN_LOG.md` (the work plan and every measurement taken), `PROGRESS.md` (build
-log), `MEMORY_CALIBRATION.md` (`--mem` sizing data).
+- [docs/VALIDATION.md](docs/VALIDATION.md) — exactly what has been checked against the
+  reference implementations, and what has not.
+- [docs/MEMORY.md](docs/MEMORY.md) — measured peak RSS per op and how to size `--mem`.
+- [BENCHMARKS.md](BENCHMARKS.md) — timings, with the commands that produced them.
 
 ## Authorship
 

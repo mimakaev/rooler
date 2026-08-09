@@ -44,10 +44,29 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install libhdf5
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libhdf5-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - name: Install
-        run: pip install ./python
-      - name: Import check
-        run: python -c "import rooler; print('rooler', rooler.__version__)"
+        run: pip install ./python pytest cooler
+
+      # the accessor tests build their own fixture with the rooler binary, and check every
+      # table against cooler's own accessors
+      - name: Build binaries for the fixture
+        run: cargo build --release --bin rooler --example genpairs
+
+      - name: Test
+        env:
+          ROOLER: target/release/rooler
+          GENPAIRS: target/release/examples/genpairs
+        run: pytest python/tests -q

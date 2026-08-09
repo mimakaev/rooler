@@ -18,8 +18,8 @@ stored blessed answer. A blessed answer only tells you the behaviour changed; an
 you which one is wrong. Please keep that pattern.
 
 **Measure performance claims.** Numbers in this repo come with the input, the machine and the
-command that produced them. `docs/PLAN_LOG.md` is the running record; add to it. A benchmark
-without a stated input size is not a benchmark.
+command that produced them — see `BENCHMARKS.md`, and keep that property. A benchmark without a
+stated input size is not a benchmark.
 
 **Correctness before speed.** Several ops write files people will analyse and publish from. An
 op that is quietly wrong is worse than one that is slow, so prefer erroring out over guessing —
@@ -37,10 +37,10 @@ wrapping.
 - **Do not change the on-disk schema casually.** Files must keep round-tripping through
   `cooler.Cooler`; `scripts/validate_vs_cooler.py` is the check.
 
-## Development history
+## Docs
 
-`docs/` holds the full record — `STATUS.md` for current state and known limits, `PLAN.md` and
-`PLAN_LOG.md` for the work plan and every measurement taken, `PROGRESS.md` for the build log.
+`docs/VALIDATION.md` records what has been verified against cooler/cooltools and what has not;
+if you add or change an op, update it. `docs/MEMORY.md` holds the measured RSS figures.
 
 ## Authorship
 
