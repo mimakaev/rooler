@@ -151,19 +151,41 @@ pairs are uniform and so delta-code poorly. Real spill was 1.87 B/key.)
 | 64 bp (base copy) | 48,254,229 | 81,477,686,796 | 1917s |
 | 128 bp | 24,127,123 | 73,965,326,303 | 5601s |
 | 256 bp | 12,063,568 | 66,268,934,613 | 9135s |
-| 512 bp, 1024 bp | — | — | still building when this was written |
+| 512 bp | 6,031,791 | 58,537,355,526 | 12265s |
+| 1024 bp | 3,015,901 | 50,807,785,752 | 15042s |
+
+Complete: **5 resolutions in 15042s (4h11m), peak RSS 0.8 GB** — zoomify is genuinely streaming;
+its whole working set is the fine->coarse bin map plus the writer's per-bin counter
+(48.25M x 8 B + 24.1M x 8 B at the widest point). Final mcool 622 GB.
 
 Note how little the pixel count drops when coarsening (81.5B -> 74.0B -> 66.3B): at this depth
 and resolution the matrix is so sparse that most pixels stay distinct, so each coarser level
 costs nearly as much as the last. That is a property of the data, not of the implementation.
 
 ### Verification
-The finished 64bp cooler opens in python `cooler` (`nnz=81477686796, binsize=64`, 24 chroms) and
-`clr.matrix().fetch("chr1:0-500,000")` returns a correct, symmetric 7813x7813 block.
+- `nnz` attr == pixel-table length == `bin1_offset[-1]` at **all five** levels.
+- **Count conservation across the whole cascade.** Coarsening maps fine bin b -> b//factor
+  monotonically within a chromosome and preserves (lo,hi) order, so the pixels with
+  `bin1 < K` at 64bp are exactly those with `bin1 < K/factor` at each coarser level. Summing
+  that slice (K = 100,000 fine bins of chr1, 247,606,698 pixels at 64bp):
+
+  | level | pixels in slice | counts |
+  |---|---|---|
+  | 64 bp | 247,606,698 | 484,364,054 |
+  | 128 bp | 230,926,281 | 484,364,054 |
+  | 256 bp | 214,714,425 | 484,364,054 |
+  | 512 bp | 198,762,128 | 484,364,054 |
+  | 1024 bp | 182,649,198 | 484,364,054 |
+
+  **Exactly equal at every level** — no counts created or lost by the cascade.
+  (Summing all 81.5B counts is impractical here; this 247M-pixel slice is the check that fits.)
+- python `cooler` opens both the finest and coarsest levels (`nnz=81477686796, binsize=64` and
+  `nnz=50807785752, binsize=1024`, 24 chroms) and `clr.matrix().fetch("chr1:0-500,000")` returns
+  correct, symmetric 7813x7813 and 489x489 blocks.
 
 ### Verdict
 The 64bp claim holds: **100B pairs -> an 81.5B-pixel, 48.3M-bin cooler and a multi-resolution
-mcool, entirely out of core, with a 29.8 GB peak** (`--mem 32`), on a machine where the data is
-~30x larger than RAM. 300B was not attempted because it needs ~1.18 TB of a 1.20 TB volume —
+mcool (5 levels, 622 GB), entirely out of core, with a 29.8 GB peak for cload (`--mem 32`) and
+0.8 GB for zoomify** — on a machine where the data is ~30x larger than RAM. 300B was not attempted because it needs ~1.18 TB of a 1.20 TB volume —
 a **disk** limit on this box, not an architectural one; the run is linear in pairs, so 300B
 would take ~3x the time and ~3x the space.
