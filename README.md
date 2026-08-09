@@ -1,6 +1,6 @@
 # rooler - a Rust rewrite of cooler
 
-**A fast, out-of-core engine for Hi-C / micro-C `.cool` files.**
+**A fast, out-of-core engine for Hi-C / micro-C `.cool` files written entirely by Claude**
 `cload` · `merge` · `zoomify` · `balance` · `expected` — plus a small Python read API.
 
 > **Alpha.** The ops are validated against `cooler`/`cooltools` and have been run on
