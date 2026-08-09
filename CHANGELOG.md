@@ -32,6 +32,18 @@ Review-fix batch (post-alpha code review; all outputs verified pixel-identical t
 where behavior was meant to be unchanged, and the 1.1 B-pixel gzip merge benchmark shows no
 performance regression).
 
+### Added
+- **Smoothed expected.** `rooler expected` now stores the full `cooltools.expected_cis` column
+  set — `n_total`, `n_valid`, `count.sum`, `count.avg`, `balanced.sum`, `balanced.avg`, and the
+  log-space Gaussian-smoothed `balanced.avg.smoothed` (per region) and
+  `balanced.avg.smoothed.agg` (genome-wide aggregate), at cooltools' defaults
+  (sigma_log10=0.1, window 5 sigma, 10 points per sigma). Every column agrees with cooltools to
+  **2.4e-15** with no NaN mismatches. A raw P(s) is noisy at large separations, so the smoothed
+  curve is what analyses actually want.
+- **`Rooler.expected(view=None, column=None)`** returns it as a DataFrame in cooltools' layout,
+  with `contact_frequency` defaulting to the smoothed genome-wide curve — the same default
+  cooltools uses. `Rooler.expected_views()` lists the stored views.
+
 ### Fixed
 - **`.pairs` positions are now read as 1-based** (the 4DN spec, and cooler's default), i.e.
   binned as `(pos-1)/binsize` rather than `pos/binsize`. The old convention shifted every read

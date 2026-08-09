@@ -91,6 +91,58 @@ class Rooler:
             self._wcache = self._weight[:]
         return self._wcache
 
+    # ---- expected: cis contact-vs-distance, as stored by `rooler expected` ----
+    def expected_views(self):
+        """Names of the stored expected views (e.g. ['arms', 'chroms'])."""
+        return sorted(self._g["expected"].keys()) if "expected" in self._g else []
+
+    def expected(self, view=None, column=None):
+        """Stored cis expected P(s) as a DataFrame, in cooltools' layout.
+
+        Columns: region1/region2, dist, dist_bp, n_total, n_valid, count.sum, count.avg,
+        balanced.sum, balanced.avg, balanced.avg.smoothed, balanced.avg.smoothed.agg, plus
+        `contact_frequency` — the value you normally want.
+
+        `contact_frequency` defaults to the **log-smoothed, genome-wide aggregated** curve
+        (`balanced.avg.smoothed.agg`), matching `cooltools.expected_cis`'s default. Raw
+        `balanced.avg` is noisy at large separations, where few pixel pairs contribute; pass
+        `column="balanced.avg"` to opt out, or any other stored column name.
+
+        `view` selects among stored views; with one view stored it is picked automatically.
+        """
+        if "expected" not in self._g:
+            raise ValueError("no expected stored; run `rooler expected` on this cooler")
+        avail = self.expected_views()
+        if view is None:
+            if len(avail) != 1:
+                raise ValueError(
+                    f"several expected views stored ({', '.join(avail)}); pass view=")
+            view = avail[0]
+        if view not in avail:
+            raise ValueError(f"no expected view {view!r} (have: {', '.join(avail) or 'none'})")
+
+        ge = self._g[f"expected/{view}/weight"]
+        df = pd.DataFrame({k: ge[k][:] for k in ge.keys() if k != "region_id"})
+        names = [n.decode() if isinstance(n, bytes) else n
+                 for n in self._g[f"views/{view}/name"][:]]
+        reg = np.asarray([names[i] for i in ge["region_id"][:]])
+        default = ge.attrs.get("default_column", "balanced.avg.smoothed.agg")
+        if isinstance(default, bytes):
+            default = default.decode()
+        col = column or default
+        if col not in df.columns:
+            raise ValueError(f"no column {col!r} (have: {', '.join(df.columns)})")
+        df["region1"] = reg
+        df["region2"] = reg                   # cis only; mirrors cooltools' layout
+        df["dist_bp"] = df["dist"] * self.binsize
+        df["contact_frequency"] = df[col].values
+        order = ["region1", "region2", "dist", "dist_bp", "contact_frequency", "n_total",
+                 "n_valid", "count.sum", "balanced.sum", "count.avg", "balanced.avg",
+                 "balanced.avg.smoothed", "balanced.avg.smoothed.agg"]
+        cols = [c for c in order if c in df.columns] + [c for c in df.columns if c not in order]
+        return (df[cols].sort_values(["region1", "dist"], kind="stable")
+                .reset_index(drop=True))
+
     def _bins_df(self, lo, hi):
         d = {"chrom": pd.Categorical.from_codes(self._g["bins/chrom"][lo:hi], self.chromnames),
              "start": self._g["bins/start"][lo:hi], "end": self._g["bins/end"][lo:hi]}

@@ -93,6 +93,8 @@ r = rooler.open("merged.mcool", 1000)
 r.raw("chr1:5,000,000-6,000,000")        # dense raw counts
 r.balanced("chr1", "chr2")               # balanced, trans
 r.matrix(balance=True).fetch("chr17")    # cooler-compatible form
+
+r.expected()                             # P(s), smoothed by default
 ```
 
 Because the output is a real cooler, this also just works:
@@ -122,8 +124,9 @@ rooler repack  <cool|mcool>  [--out new.cool | --backup] [--assembly hg38] [--me
   cache-blocked kernel (worth ~2.8× on fine-resolution coolers) engages automatically above
   4 M bins; `--block` overrides, `--mem` bounds RAM (scratch spills to a disk-backed mmap
   beyond it).
-- **expected** — cis distance-decay P(s) per region, stored in the cooler. Views can be
-  `chroms`, `arms`, or your own BED; several views coexist in one file.
+- **expected** — cis distance-decay P(s) per region, stored in the cooler with the full
+  cooltools column set including the **log-smoothed** curves. Views can be `chroms`, `arms`,
+  or your own BED; several views coexist in one file.
 - **repack** — rewrite an existing cooler/mcool the way rooler would have written it:
   parallel-gzip compression, assembly stamped **and checked against the chromosome sizes**,
   balanced if it carries no weights, expected stored. In place by default (`--backup` keeps
@@ -167,6 +170,12 @@ Validated against the reference implementations: `cload` output is **byte-identi
 
 `.pairs` coordinates are read as **1-based**, per the 4DN spec and cooler's default; pass
 `--zero-based` for a file that genuinely is not.
+
+`expected` stores the same columns `cooltools.expected_cis` returns — `n_total`, `n_valid`,
+`count.sum/avg`, `balanced.sum/avg`, and the log-smoothed `balanced.avg.smoothed` and
+`balanced.avg.smoothed.agg` — all agreeing with cooltools to **2.4e-15**. `r.expected()`
+returns them as a DataFrame whose `contact_frequency` column defaults to the smoothed,
+genome-wide aggregated curve, matching cooltools' default; pass `column=` to choose another.
 
 ## Tests
 

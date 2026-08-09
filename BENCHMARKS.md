@@ -111,7 +111,7 @@ Speed is only interesting if the answers match. They do.
 | `zoomify` | vs `cooler.coarsen_cooler` | **exact**; counts conserved at every level |
 | `balance` | vs `cooler.balance_cooler`, same tolerance | **0** mask disagreements; weights agree to **2.5e-6** (median; p99 3.4e-6) |
 | `balance` | 1.12 B-pixel cooler, both at default tolerance | **0** mask disagreements; median **8.1e-6** (p99 4.5e-5) |
-| `expected` | vs `cooltools.expected_cis` | **6.4e-16** — machine precision |
+| `expected` | vs `cooltools.expected_cis`, all 13 columns incl. log-smoothed | **2.4e-15** — machine precision, 0 NaN mismatches |
 
 ### The benchmark found a bug
 
