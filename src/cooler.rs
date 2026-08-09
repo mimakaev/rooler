@@ -133,7 +133,7 @@ impl CoolerPix {
     }
 }
 impl crate::merge::BlockSource for CoolerPix {
-    fn next(&mut self) -> Result<Option<(Vec<i64>, Vec<i64>)>> {
+    fn next(&mut self) -> Result<Option<(Vec<i64>, crate::merge::Counts)>> {
         if self.pos >= self.end { return Ok(None); }
         let hi = std::cmp::min(self.pos + self.block, self.end);
         let b1 = self.b1.read_slice_1d::<i64, _>(self.pos..hi)?;
@@ -142,7 +142,7 @@ impl crate::merge::BlockSource for CoolerPix {
         let keys: Vec<i64> = (0..b1.len()).map(|i| b1[i] * self.nbins + b2[i]).collect();
         let cnts: Vec<i64> = cn.iter().map(|&x| x as i64).collect();
         self.pos = hi;
-        Ok(Some((keys, cnts)))
+        Ok(Some((keys, crate::merge::Counts::PerKey(cnts))))
     }
 }
 

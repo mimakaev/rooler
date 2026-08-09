@@ -53,3 +53,36 @@ Benchmark — single-input merge (a pure 1.1B-pixel re-write), `e2e/base.cool`, 
   within 8% of the read+merge path itself. Further write optimization (P3.5 blosc direct-chunk)
   would buy ~nothing for merge; the remaining cost is the k-way merge/read side.
 - Scales: the 2.56B-pixel cooler re-writes with gzip4 in **64s** (5.9 GB out).
+
+## Phase 4 gate — cload phase split after P3 (2026-08-09)
+`cload ENCFF514KZU.pairs.gz 256 --mem 8 --threads 8` (2,610,545,790 pairs -> 2,563,532,430 pixels):
+- phase A (parse + bin + sort + compressed spill, 24 runs): **35s** (74 Mpairs/s)
+- phase B (single-thread k-way merge + write): **123s**
+- total **158s** -> phase B is **78% of wall time**, far above the 35% skip threshold.
+=> **P4 proceeds.** (P3 did not touch this: cload's default preset is blosc, whose write path
+is unchanged; and phase B's cost is dominated by the single-thread k-way merge itself.)
+
+## Phase 4 — ranged-parallel cload phase B (2026-08-09)
+`cload ENCFF514KZU.pairs.gz 256 --mem 8 --threads 8`, 2.61B pairs -> 2,563,532,430 pixels:
+
+| | phase A | phase B | total |
+|---|---|---|---|
+| before (serial phase B) | 35s | 123s | **158s** |
+| after (8 ranges x 8 threads) | 35s | **71s** | **106s** |
+
+- **1.5x end to end, 1.7x on phase B**; output **pixel-identical** to the reference cooler
+  (all 2,563,532,430 pixels, bins, indexes, attrs — `validate_vs_cooler.py`).
+- Not 8x because the single writer thread serializes the append side; that is by design
+  (HDF5 stays on one thread) and is the next limit if phase B is ever revisited.
+- Cross-check that the write is no longer the phase-B bottleneck: the same cload with the
+  *parallel* gzip writer takes 116s (vs 108s blosc) while burning 9m54 user vs 6m31 — more
+  CPU, no wall-clock win. Phase B is now merge/read-bound. (gzip does give a 12% smaller
+  file: 5.88 GB vs 6.70 GB.)
+- SPILL_BLK 1M -> 128K as planned, so resident RAM (ranges x runs x one decoded block) stays
+  small enough to keep P ranges parallel at high run counts. Measured compression cost:
+  **1.866 vs 1.860 B/key = 0.3%**, far under the 10% budget.
+- `RunReader::open_range` seek rule, and the bug the test caught: seeking to the last block
+  with `first_key <= lo` **drops pixels** when a run of equal keys straddles a block boundary
+  and lo lands on that key — the trailing duplicates in the earlier block are skipped. The
+  predicate must be strict (`first_key < lo`). Found by the range-partition unit test before
+  it ever ran at scale; it would have silently lost counts.

@@ -7,20 +7,33 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Counts for a block. Spilled cload runs are one-pair-per-key, so `Ones` lets them skip
+/// materializing a vec of 1s — that halves phase-B resident memory per source.
+pub enum Counts {
+    Ones,
+    PerKey(Vec<i64>),
+}
+impl Counts {
+    #[inline]
+    pub fn at(&self, i: usize) -> i64 {
+        match self { Counts::Ones => 1, Counts::PerKey(v) => v[i] }
+    }
+}
+
 pub trait BlockSource {
     /// Next sorted block as (keys, counts); None when exhausted. Empty blocks are skipped.
-    fn next(&mut self) -> Result<Option<(Vec<i64>, Vec<i64>)>>;
+    fn next(&mut self) -> Result<Option<(Vec<i64>, Counts)>>;
 }
 
 struct Cursor<S: BlockSource> {
     src: S,
     k: Vec<i64>,
-    c: Vec<i64>,
+    c: Counts,
     pos: usize,
 }
 impl<S: BlockSource> Cursor<S> {
     fn new(src: S) -> Result<Cursor<S>> {
-        let mut cur = Cursor { src, k: Vec::new(), c: Vec::new(), pos: 0 };
+        let mut cur = Cursor { src, k: Vec::new(), c: Counts::Ones, pos: 0 };
         cur.fill()?;
         Ok(cur)
     }
@@ -60,7 +73,7 @@ pub fn merge_sources<S: BlockSource>(
             // drain this cursor's full run of k (may span blocks)
             loop {
                 match cur[i].head() {
-                    Some(h) if h == k => { sum += cur[i].c[cur[i].pos]; cur[i].pos += 1;
+                    Some(h) if h == k => { sum += cur[i].c.at(cur[i].pos); cur[i].pos += 1;
                         if cur[i].pos >= cur[i].k.len() && !cur[i].fill()? { break; } }
                     _ => break,
                 }
@@ -131,7 +144,30 @@ mod tests {
         fn new(blocks: Vec<(Vec<i64>, Vec<i64>)>) -> VecSource { VecSource(blocks.into_iter()) }
     }
     impl BlockSource for VecSource {
-        fn next(&mut self) -> Result<Option<(Vec<i64>, Vec<i64>)>> { Ok(self.0.next()) }
+        fn next(&mut self) -> Result<Option<(Vec<i64>, Counts)>> {
+            Ok(self.0.next().map(|(k, c)| (k, Counts::PerKey(c))))
+        }
+    }
+
+    /// Same blocks but declared as count=1 (the cload spill-run shape).
+    struct OnesSource(std::vec::IntoIter<Vec<i64>>);
+    impl BlockSource for OnesSource {
+        fn next(&mut self) -> Result<Option<(Vec<i64>, Counts)>> {
+            Ok(self.0.next().map(|k| (k, Counts::Ones)))
+        }
+    }
+
+    #[test]
+    fn ones_counts_aggregate_like_explicit_ones() {
+        // Counts::Ones must behave exactly like PerKey(vec![1; n]) -- it is the cload path
+        let blocks = vec![vec![1i64, 2, 2], vec![2, 5], vec![5, 5, 9]];
+        let ones = OnesSource(blocks.clone().into_iter());
+        let explicit = VecSource::new(blocks.into_iter().map(|k| { let n = k.len(); (k, vec![1i64; n]) }).collect());
+        let (mut ka, mut ca) = (Vec::new(), Vec::new());
+        merge_sources(vec![ones], 2, |k, c| { ka.extend_from_slice(k); ca.extend_from_slice(c); Ok(()) }).unwrap();
+        let (mut kb, mut cb) = (Vec::new(), Vec::new());
+        merge_sources(vec![explicit], 2, |k, c| { kb.extend_from_slice(k); cb.extend_from_slice(c); Ok(()) }).unwrap();
+        assert_eq!((ka, ca), (kb, cb));
     }
 
     /// run merge_sources with a tiny emit block and collect the whole output

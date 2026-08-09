@@ -3,8 +3,8 @@
 //! N worker threads each parse+bin+sort+spill their own runs. Phase B: k-way drain-and-count
 //! merge over all runs (count=1) -> writer. RAM bounded by --mem (N worker buffers of mem/N).
 use crate::cooler::{CoolWriter, Comp};
-use crate::merge::{merge_sources_to_writer, BlockSource};
-use anyhow::{anyhow, Result};
+use crate::merge::{merge_sources, merge_sources_to_writer, BlockSource, Counts};
+use anyhow::{anyhow, bail, Result};
 use crossbeam_channel::{bounded, Receiver};
 use lz4_flex::block::{compress, decompress};
 use memchr::{memchr, memrchr};
@@ -13,7 +13,11 @@ use std::io::{Read, Write, BufWriter, BufReader};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 
-const SPILL_BLK: usize = 1_000_000; // keys per compressed spill block
+/// Keys per compressed spill block. Smaller blocks mean smaller decode buffers, which keeps
+/// the ranged-parallel phase B parallel when there are many runs (resident RAM there is
+/// ranges x runs x one decoded block). Measured cost of 128K vs 1M: 1.866 vs 1.860 B/key,
+/// i.e. 0.3% — nothing.
+const SPILL_BLK: usize = 131_072;
 
 pub fn shuffle8(d: &[i64]) -> Vec<u8> {
     let n = d.len(); let mut o = vec![0u8; 8 * n];
@@ -68,9 +72,16 @@ pub fn parse_line(line: &[u8], bins: &Bins, cache: &mut ChromCache) -> Result<Op
     Ok(Some(lo * bins.nbins + hi))
 }
 
-/// Write sorted keys as compressed spill blocks: per block, delta + byte-shuffle + LZ4
-/// (~1.8 B/key vs 8 raw -> 4.5x less spill IO). Block layout: [n u32][clen u32][lz4 bytes].
+/// Spill run file: [magic 8B] then blocks of [n u32][clen u32][first_key i64][lz4 bytes].
+/// Keys are delta-coded, byte-shuffled and LZ4'd (~1.8 B/key vs 8 raw -> 4.5x less spill IO).
+/// `first_key` lets a reader seek to a key range by scanning headers only, no decompression,
+/// which is what makes the ranged-parallel phase-B merge possible.
+/// Runs are transient within one cload call, so the format needs no backward compatibility.
+const SPILL_MAGIC: &[u8; 8] = b"RKZ2\0\0\0\0";
+const SPILL_HDR: usize = 16;
+
 pub fn write_spill(w: &mut impl Write, sorted_keys: &[i64]) -> Result<()> {
+    w.write_all(SPILL_MAGIC)?;
     for chunk in sorted_keys.chunks(SPILL_BLK) {
         let n = chunk.len();
         let mut d = vec![0i64; n];
@@ -79,9 +90,30 @@ pub fn write_spill(w: &mut impl Write, sorted_keys: &[i64]) -> Result<()> {
         let comp = compress(&shuffle8(&d));
         w.write_all(&(n as u32).to_le_bytes())?;
         w.write_all(&(comp.len() as u32).to_le_bytes())?;
+        w.write_all(&chunk[0].to_le_bytes())?;
         w.write_all(&comp)?;
     }
     Ok(())
+}
+
+/// (first_key, byte offset of the block header) for every block in a run — header scan only.
+pub fn scan_spill_index(path: &str) -> Result<Vec<(i64, u64)>> {
+    use std::io::{Seek, SeekFrom};
+    let mut f = BufReader::new(std::fs::File::open(path)?);
+    let mut magic = [0u8; 8];
+    f.read_exact(&mut magic)?;
+    if &magic != SPILL_MAGIC { bail!("{}: not a rooler spill run (bad magic)", path); }
+    let mut out = Vec::new();
+    let mut pos = 8u64;
+    loop {
+        let mut hdr = [0u8; SPILL_HDR];
+        if f.read_exact(&mut hdr).is_err() { break; } // EOF
+        let clen = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as u64;
+        out.push((i64::from_le_bytes(hdr[8..16].try_into().unwrap()), pos));
+        pos += SPILL_HDR as u64 + clen;
+        f.seek(SeekFrom::Start(pos))?;
+    }
+    Ok(out)
 }
 
 fn worker(rx: Receiver<Vec<u8>>, bins: Arc<Bins>, cap: usize, tmpdir: Arc<String>, wid: usize)
@@ -205,14 +237,11 @@ pub fn cload(pairs: &str, binsize: i64, out: &str, mem_gb: f64, nthreads: usize,
     if log { eprintln!("  phase1: {} pairs -> {} runs, {:.0}s ({:.0} Mpairs/s)",
         npairs, run_paths.len(), t0.elapsed().as_secs_f64(), npairs as f64 / t0.elapsed().as_secs_f64() / 1e6); }
 
-    // --- phase B: single-thread k-way drain-and-count merge over the spilled runs ---
-    // (ranged-parallel phase B is PLAN.md P4; phase-B RAM = #runs x SPILL_BLK decode buffers)
+    // --- phase B: ranged-parallel k-way drain-and-count merge over the spilled runs ---
     let mut off = vec![0i64];
     for &l in &lengths { off.push(off.last().unwrap() + (l + binsize - 1) / binsize); }
     let mut w = CoolWriter::create(out, &names, &lengths, binsize, nbins as usize, &off, comp, &asm)?;
-    let nnz = merge_sources_to_writer(
-        run_paths.iter().map(|p| RunReader::open(p)).collect::<Result<Vec<_>>>()?,
-        nbins, &mut w)?;
+    let nnz = merge_runs_parallel(&run_paths, nbins, nthreads, mem_gb, &mut w, log)?;
     w.close()?;
     for p in &run_paths { let _ = std::fs::remove_file(p); }
     let _ = std::fs::remove_dir(tmpdir);
@@ -220,27 +249,139 @@ pub fn cload(pairs: &str, binsize: i64, out: &str, mem_gb: f64, nthreads: usize,
     Ok(nnz)
 }
 
+/// Phase B: split the key space into P ranges (from the runs' per-block first_keys), merge each
+/// range on its own thread, and stream the range outputs to the single writer IN ORDER over
+/// bounded channels. Backpressure bounds RAM; no temp files, and HDF5 stays on one thread.
+fn merge_runs_parallel(
+    run_paths: &[String], nbins: i64, nthreads: usize, mem_gb: f64, w: &mut CoolWriter, log: bool,
+) -> Result<u64> {
+    // resident during phase B ~ ranges x runs x (SPILL_BLK keys decoded + scratch) ~ 1.1 MB each
+    let per_reader_bytes = SPILL_BLK as f64 * 8.0 * 1.4;
+    let nruns = run_paths.len().max(1);
+    let budget = ((mem_gb * 0.5 * 1e9) / (nruns as f64 * per_reader_bytes)) as usize;
+    let p = nthreads.min(budget).max(1);
+    if p <= 1 || nruns == 0 {
+        if log { eprintln!("  phase2: serial merge ({} runs)", nruns); }
+        return merge_sources_to_writer(
+            run_paths.iter().map(|s| RunReader::open(s)).collect::<Result<Vec<_>>>()?, nbins, w);
+    }
+    // one header-only scan per run gives both the range pivots and the per-run block index
+    let indexes: Vec<Vec<(i64, u64)>> = run_paths.iter().map(|s| scan_spill_index(s)).collect::<Result<_>>()?;
+    let mut firsts: Vec<i64> = indexes.iter().flat_map(|v| v.iter().map(|&(k, _)| k)).collect();
+    firsts.sort_unstable();
+    let mut bounds = vec![i64::MIN];
+    if !firsts.is_empty() {
+        for i in 1..p {
+            let k = firsts[i * firsts.len() / p];
+            if k > *bounds.last().unwrap() { bounds.push(k); }
+        }
+    }
+    bounds.push(i64::MAX);
+    let nranges = bounds.len() - 1;
+    if log { eprintln!("  phase2: {} runs, {} ranges x {} threads", nruns, nranges, p); }
+
+    let paths = Arc::new(run_paths.to_vec());
+    let idx = Arc::new(indexes);
+    let nclamped = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut rxs = Vec::new();
+    let mut handles = Vec::new();
+    for r in 0..nranges {
+        let (lo, hi) = (bounds[r], bounds[r + 1]);
+        let (tx, rx) = bounded::<(Vec<i64>, Vec<i64>, Vec<i32>)>(2);
+        rxs.push(rx);
+        let (pa, ia, nc) = (paths.clone(), idx.clone(), nclamped.clone());
+        handles.push(std::thread::spawn(move || -> Result<u64> {
+            let srcs: Vec<RunReader> = pa.iter().enumerate()
+                .map(|(k, s)| RunReader::open_range(s, &ia[k], lo, hi))
+                .collect::<Result<_>>()?;
+            let mut local = 0u64;
+            let n = merge_sources(srcs, 1 << 22, |keys, cnts| {
+                let b1 = keys.iter().map(|&x| x / nbins).collect();
+                let b2 = keys.iter().map(|&x| x % nbins).collect();
+                let c = cnts.iter().map(|&x| crate::cooler::clamp_count(x, &mut local)).collect();
+                tx.send((b1, b2, c)).map_err(|_| anyhow!("phase-B channel closed")).map(|_| ())
+            });
+            nc.fetch_add(local, std::sync::atomic::Ordering::Relaxed);
+            n
+        }));
+    }
+    // writer drains ranges in order; later ranges keep merging concurrently behind their channels
+    let mut nnz = 0u64;
+    for rx in &rxs {
+        while let Ok((b1, b2, c)) = rx.recv() { w.append(&b1, &b2, &c)?; nnz += b1.len() as u64; }
+    }
+    for h in handles { h.join().unwrap()?; }
+    let nc = nclamped.load(std::sync::atomic::Ordering::Relaxed);
+    if nc > 0 { eprintln!("  WARNING: {} pixels clamped at i32::MAX (counts are stored as i32)", nc); }
+    Ok(nnz)
+}
+
 /// Reads i64 keys from a spilled run in blocks; yields (keys, counts=1).
-pub struct RunReader { f: BufReader<std::fs::File> }
+/// Optionally confined to a half-open key range [lo, hi) for the ranged-parallel phase B.
+pub struct RunReader {
+    f: BufReader<std::fs::File>,
+    lo: i64,
+    hi: Option<i64>,
+    done: bool,
+}
 impl RunReader {
     pub fn open(p: &str) -> Result<RunReader> {
-        Ok(RunReader { f: BufReader::new(std::fs::File::open(p)?) })
+        let mut f = BufReader::new(std::fs::File::open(p)?);
+        let mut magic = [0u8; 8];
+        f.read_exact(&mut magic)?;
+        if &magic != SPILL_MAGIC { bail!("{}: not a rooler spill run (bad magic)", p); }
+        Ok(RunReader { f, lo: i64::MIN, hi: None, done: false })
+    }
+
+    /// Reader restricted to keys in [lo, hi). `index` comes from `scan_spill_index` (headers
+    /// only), so seeking costs no decompression. Blocks are key-sorted, so clipping within a
+    /// block is a pair of binary searches; ranges partition key space and every duplicate of a
+    /// key lands in exactly one range, so no pixel is split across ranges.
+    ///
+    /// Seek rule: start at the LAST block whose first_key is *strictly* less than lo. A key
+    /// equal to lo may have duplicates trailing at the end of that earlier block (a run of
+    /// equal keys can straddle a block boundary), and `<=` here would skip them.
+    /// Everything before that block is bounded above by its first_key, hence entirely < lo.
+    pub fn open_range(p: &str, index: &[(i64, u64)], lo: i64, hi: i64) -> Result<RunReader> {
+        use std::io::{Seek, SeekFrom};
+        let mut r = Self::open(p)?;
+        r.lo = lo;
+        r.hi = Some(hi);
+        let start = index.partition_point(|&(fk, _)| fk < lo).saturating_sub(1);
+        match index.get(start) {
+            Some(&(_, off)) => { r.f.seek(SeekFrom::Start(off))?; }
+            None => { r.done = true; }  // empty run
+        }
+        Ok(r)
     }
 }
 impl BlockSource for RunReader {
-    fn next(&mut self) -> Result<Option<(Vec<i64>, Vec<i64>)>> {
-        let mut hdr = [0u8; 8];
-        if self.f.read_exact(&mut hdr).is_err() { return Ok(None); } // EOF
-        let n = u32::from_le_bytes(hdr[0..4].try_into().unwrap()) as usize;
-        let clen = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as usize;
-        let mut cbuf = vec![0u8; clen];
-        self.f.read_exact(&mut cbuf)?;
-        let raw = decompress(&cbuf, 8 * n).map_err(|e| anyhow!("spill decompress: {}", e))?;
-        let d = unshuffle8(&raw, n);
-        let mut keys = vec![0i64; n];
-        let mut acc = 0i64;
-        for i in 0..n { acc += d[i]; keys[i] = acc; }
-        Ok(Some((keys, vec![1i64; n])))
+    fn next(&mut self) -> Result<Option<(Vec<i64>, Counts)>> {
+        loop {
+            if self.done { return Ok(None); }
+            let mut hdr = [0u8; SPILL_HDR];
+            if self.f.read_exact(&mut hdr).is_err() { return Ok(None); } // EOF
+            let n = u32::from_le_bytes(hdr[0..4].try_into().unwrap()) as usize;
+            let clen = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as usize;
+            let first = i64::from_le_bytes(hdr[8..16].try_into().unwrap());
+            // this block and all later ones start at/after hi -> nothing more for this range
+            if let Some(hi) = self.hi {
+                if first >= hi { self.done = true; return Ok(None); }
+            }
+            let mut cbuf = vec![0u8; clen];
+            self.f.read_exact(&mut cbuf)?;
+            let raw = decompress(&cbuf, 8 * n).map_err(|e| anyhow!("spill decompress: {}", e))?;
+            let d = unshuffle8(&raw, n);
+            let mut keys = vec![0i64; n];
+            let mut acc = 0i64;
+            for i in 0..n { acc += d[i]; keys[i] = acc; }
+            if self.hi.is_none() { return Ok(Some((keys, Counts::Ones))); }
+            // clip to [lo, hi) -- only the first and last block of a range are ever partial
+            let s = keys.partition_point(|&k| k < self.lo);
+            let e = keys.partition_point(|&k| k < self.hi.unwrap());
+            if s >= e { continue; }  // wholly outside the range; try the next block
+            return Ok(Some((keys[s..e].to_vec(), Counts::Ones)));
+        }
     }
 }
 
@@ -304,6 +445,56 @@ mod tests {
         }
     }
 
+    /// Ranged readers must partition the run exactly: concatenating the ranges in order must
+    /// reproduce the whole key stream, with no key lost, duplicated or reordered.
+    #[test]
+    fn ranged_readers_partition_the_run_exactly() {
+        let n = 3 * SPILL_BLK + 517;
+        let mut keys: Vec<i64> = Vec::with_capacity(n);
+        let mut acc = 0i64;
+        let mut s = 42u64;
+        for i in 0..n {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+            // deliberately include duplicate keys: they must never straddle a range boundary
+            acc += if i % 3 == 0 { 0 } else { (s >> 40) as i64 % 50 + 1 };
+            keys.push(acc);
+        }
+        let dir = std::env::temp_dir().join(format!("rooler_range_test_{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("r.kz");
+        {
+            let mut w = BufWriter::new(std::fs::File::create(&path).unwrap());
+            write_spill(&mut w, &keys).unwrap();
+            w.flush().unwrap();
+        }
+        let ps = path.to_str().unwrap();
+        let index = scan_spill_index(ps).unwrap();
+        assert_eq!(index.len(), 4, "expected 4 spill blocks");
+        assert!(index.windows(2).all(|w| w[0].0 <= w[1].0), "block first_keys must be sorted");
+
+        for bounds in [
+            vec![i64::MIN, i64::MAX],                                    // single range
+            vec![i64::MIN, keys[n / 2], i64::MAX],                        // split on a real key
+            vec![i64::MIN, index[1].0, index[2].0, index[3].0, i64::MAX],  // split on block starts
+            vec![i64::MIN, keys[0], keys[0] + 1, keys[n - 1], i64::MAX],   // degenerate edges
+            vec![i64::MIN, -5, i64::MAX],                                 // range before all keys
+            vec![i64::MIN, keys[n - 1] + 1000, i64::MAX],                 // range after all keys
+        ] {
+            let mut got = Vec::with_capacity(n);
+            for r in 0..bounds.len() - 1 {
+                let mut rr = RunReader::open_range(ps, &index, bounds[r], bounds[r + 1]).unwrap();
+                while let Some((k, _)) = rr.next().unwrap() {
+                    assert!(k.iter().all(|&x| x >= bounds[r] && x < bounds[r + 1]),
+                        "reader emitted a key outside [{}, {})", bounds[r], bounds[r + 1]);
+                    got.extend_from_slice(&k);
+                }
+            }
+            assert_eq!(got, keys, "ranges {:?} did not reproduce the run", bounds);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn spill_roundtrips_across_block_boundaries() {
         // more than 2 full SPILL_BLK blocks + a partial one
@@ -331,8 +522,9 @@ mod tests {
         let mut rr = RunReader::open(path.to_str().unwrap()).unwrap();
         let mut got = Vec::with_capacity(n);
         while let Some((k, c)) = rr.next().unwrap() {
-            assert!(c.iter().all(|&x| x == 1), "run counts are all 1");
-            assert_eq!(k.len(), c.len());
+            // spill runs are one pair per key -> Counts::Ones (no materialized vec of 1s)
+            assert!(matches!(c, Counts::Ones), "spill runs must yield Counts::Ones");
+            assert!((0..k.len()).all(|i| c.at(i) == 1));
             got.extend_from_slice(&k);
         }
         assert_eq!(got, keys);
