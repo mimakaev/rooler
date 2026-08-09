@@ -35,6 +35,14 @@ fn stream_pixels(g: &hdf5::Group, block: usize, mut f: impl FnMut(&[i64], &[i64]
     Ok(())
 }
 
+/// Default-on path (balance/zoomify/repack): compute expected with the per-organism default
+/// view, but never fail the parent op over it — an unknown genome just warns and moves on.
+pub fn expected_or_warn(uri: &str, log: bool) {
+    if let Err(e) = expected(uri, None, log) {
+        eprintln!("  WARNING: expected not computed ({}); run `rooler expected --view ...` manually", e);
+    }
+}
+
 pub fn expected(uri: &str, view_req: Option<&str>, log: bool) -> Result<()> {
     let t0 = std::time::Instant::now();
     let (path, grp) = match uri.split_once("::") { Some((a, b)) => (a.to_string(), b.to_string()), None => (uri.to_string(), "/".to_string()) };

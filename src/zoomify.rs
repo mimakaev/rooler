@@ -175,7 +175,7 @@ mod tests {
 /// while any File/Group/Dataset from the build is still alive.
 pub fn zoomify_and_balance(
     src: &str, out: &str, resolutions: Option<Vec<i64>>, comp: Comp, assembly: Option<&str>,
-    balance: bool, nthreads: usize, mem_gb: f64, log: bool,
+    balance: bool, nthreads: usize, mem_gb: f64, expected: bool, log: bool,
 ) -> Result<()> {
     let reslist = zoomify(src, out, resolutions, comp, assembly, log)?;
     if !balance { return Ok(()); }
@@ -186,6 +186,9 @@ pub fn zoomify_and_balance(
         // kernel choice (row vs tiled) and scratch placement (RAM vs disk) auto-route in balance
         crate::balance::balance(&uri, crate::balance::Params {
             nthreads, mem_gb, ..Default::default() }, log)?;
+        // expected is on by default once weights exist: an O(nnz) pass, and the thing people
+        // actually wait days for with cooltools. Per-organism default view; warns if unknown.
+        if expected { crate::expected::expected_or_warn(&uri, log); }
     }
     if log { eprintln!("  zoomify: balanced {} resolutions in {:.0}s", reslist.len(), t0.elapsed().as_secs_f64()); }
     Ok(())

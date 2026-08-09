@@ -10,6 +10,7 @@ pub mod cooler;
 pub mod expected;
 pub mod merge;
 pub mod parwrite;
+pub mod repack;
 pub mod scratch;
 pub mod scratch_tiled;
 pub mod view;

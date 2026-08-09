@@ -15,6 +15,7 @@ sizing data, `../GZIP_PARALLEL_FINDINGS.md` the parallel-gzip study that P3 impl
 | **expected** | O(nnz) streaming `sum_balanced` + FFT mask-autocorr `n_valid`; arms/chroms/custom-BED views | 6.4e-16 vs cooltools; e2e brute-force O(n²) oracle | seconds |
 | **write path** | blosc:zstd:1 (default) or **parallel direct-chunk gzip** (`H5Dwrite_chunk` + libdeflater) | pixel-identical to serial gzip; plain SHUFFLE+DEFLATE, no plugins needed | gzip **3.8× faster** and 4.2% smaller than before |
 | **Python read API** | `rooler.open()`, `raw()/balanced()`, cooler-compat `matrix()/bins()/pixels()` | exact vs cooler; cooltools runs natively on the files | — |
+| **repack** | rewrite existing cooler/mcool: gzip preset, assembly stamped+fingerprint-verified, weights carried (or balanced), expected stored; in-place/`--backup`/`--out` | pixels+weights identical to source; wrong assembly refused (tested) | pixel copy at writer speed |
 
 Scale proofs (real data): **megacooler** = 10 ENCODE files (~40B pairs) → 26.3B-pixel 53GB
 cooler @256bp in ~63 min, balanced at 70GB peak RSS.
@@ -28,7 +29,7 @@ volume), not an architectural one. See `PLAN_LOG.md`.
 "No mystery coolers" (assembly required) enforced everywhere.
 
 ## Tests
-`cargo test --release` — **42 tests, ~0.6s**, no python/network/fixtures.
+`cargo test --release` — **44 tests, ~0.6s**, no python/network/fixtures.
 - Unit: codecs (bin2-delta shuffle+LZ4, u8+exception counts, spill runs incl. ranged readers),
   k-way merge semantics, pairs parsing, coarsening bin map, genome/BED views, cooler writer
   (round-trip, index validity, append order, preset parsing), parallel-gzip direct chunks.
@@ -88,6 +89,16 @@ Bugs caught by the new tests before they reached data:
 
 ## Suggested next steps
 1. Run the full distiller chain against rooler as a drop-in and fix whatever friction appears.
-2. KR balancing if anyone actually wants it (deprioritized — tolerance is the real lever).
-3. `noodles-bgzf` to drop the external `bgzip` dependency.
-4. Real centromere tables for the newly added genomes (currently whole-chromosome defaults).
+2. **Coarsen (zoomify) is read+aggregate bound, not write bound**: the write side is the
+   parallel gzip packer, but the read side is HDF5's *single-threaded* inflate plus a
+   single-threaded map/RowAgg loop (~17 Mpix/s/level at the 2.5B benchmark). Two proven-shape
+   levers, unimplemented: (a) ranged-parallel coarsen — partition bin1 at coarse-row
+   boundaries, aggregate ranges on threads, drain in order to the writer (exactly the
+   merge/cload phase-B pattern); (b) a direct-chunk *reader* (H5Dread_chunk + libdeflater on
+   rayon threads — the mirror of parwrite.rs) to break the serial inflate. A "one giant tree
+   of all levels" pass was considered and rejected: the cascade already reads each level once
+   and chains level-to-level; at depth the levels barely shrink, so every level's write cost
+   is irreducible and the tree only adds HDF5 chunk-interleaving complexity.
+3. KR balancing if anyone actually wants it (deprioritized — tolerance is the real lever).
+4. `noodles-bgzf` to drop the external `bgzip` dependency.
+5. Real centromere tables for the newly added genomes (currently whole-chromosome defaults).

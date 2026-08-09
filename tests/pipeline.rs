@@ -296,7 +296,7 @@ fn zoomify_balance_covers_every_level() -> Result<()> {
     let mc = p("out.mcool");
     let levels = vec![BINSIZE, BINSIZE * 2, BINSIZE * 4];
     zoomify::zoomify_and_balance(&base, &mc, Some(levels.clone()), Comp::parse("blosc:zstd:1")?,
-        None, true, 4, 8.0, false)?;
+        None, true, 4, 8.0, true, false)?;
     for res in &levels {
         let g = format!("resolutions/{}", res);
         let w = read_f64(&mc, &g, "bins/weight")?;
@@ -305,6 +305,10 @@ fn zoomify_balance_covers_every_level() -> Result<()> {
         let conv = f.group(&g)?.dataset("bins/weight")?.attr("converged")?
             .read_scalar::<hdf5::types::VarLenAscii>()?;
         assert_eq!(conv.as_str(), "True", "{}bp did not converge", res);
+        // expected is on by default after each balance; the hg38-fingerprinted test genome
+        // resolves to the per-organism default view (arms)
+        assert!(f.link_exists(&format!("{}/expected/arms/weight", g)),
+            "{}bp: no default expected written", res);
     }
     std::fs::remove_dir_all(d).ok();
     Ok(())
@@ -416,6 +420,62 @@ fn zoomify_resolution_lists_are_validated_and_flexible() -> Result<()> {
         assert_eq!(got.2.iter().map(|&x| x as i64).sum::<i64>(), 20_000,
             "{}x level loses counts", factor);
     }
+    std::fs::remove_dir_all(d).ok();
+    Ok(())
+}
+
+/// repack: rewrite with the default preset, carry weights, verify assembly, compute expected.
+#[test]
+fn repack_rewrites_carries_weights_and_verifies_assembly() -> Result<()> {
+    use rooler::repack::{repack, RepackOpts};
+    let case = make_case("repack", 30_000, 555)?;
+    let d = &case.dir;
+    let p = |n: &str| d.join(n).to_str().unwrap().to_string();
+    let base = p("base.cool");
+    cload::cload(case.pairs.to_str().unwrap(), BINSIZE, &base, 0.01, 2,
+        Comp::parse("blosc:zstd:1")?, &p("runs"), None, true, false)?;
+    balance::balance(&base, balance::Params {
+        ignore_diags: 0, mad_max: 0.0, min_nnz: 2.0, min_count: 0.0,
+        tol: 1e-8, max_iters: 500, nthreads: 2, tiled_block: Some(0), mem_gb: 8.0 }, false)?;
+    let w_before = read_f64(&base, "/", "bins/weight")?;
+
+    // --out repack: source untouched, output gzip, pixels + weights identical, expected present
+    let out = p("repacked.cool");
+    repack(&base, RepackOpts { out: Some(out.clone()), backup: false, assembly: None,
+        comp: Comp::parse("gzip1")?, nthreads: 2, mem_gb: 8.0, expected: true }, false)?;
+    assert_eq!(read_pixels(&out, "/")?, read_pixels(&base, "/")?, "repack changed the pixel table");
+    let w_after = read_f64(&out, "/", "bins/weight")?;
+    assert_eq!(w_before.len(), w_after.len());
+    for i in 0..w_before.len() {
+        assert!(w_before[i].to_bits() == w_after[i].to_bits()
+            || (w_before[i].is_nan() && w_after[i].is_nan()),
+            "weight changed at bin {}: {} vs {}", i, w_before[i], w_after[i]);
+    }
+    {
+        let f = hdf5::File::open(&out)?;
+        assert!(f.link_exists("expected/arms/weight"), "repack did not write default expected");
+        let filt = format!("{:?}", f.dataset("pixels/count")?.filters());
+        assert!(filt.to_lowercase().contains("deflate"), "repack output not gzip: {}", filt);
+        let conv = f.dataset("bins/weight")?.attr("converged")?
+            .read_scalar::<hdf5::types::VarLenAscii>()?;
+        assert_eq!(conv.as_str(), "True", "weight attrs not carried");
+    }
+
+    // in-place with --backup: original preserved at .bac, source replaced
+    let before = read_pixels(&base, "/")?;
+    repack(&base, RepackOpts { out: None, backup: true, assembly: None,
+        comp: Comp::parse("gzip1")?, nthreads: 2, mem_gb: 8.0, expected: false }, false)?;
+    assert!(std::path::Path::new(&format!("{}.bac", base)).exists(), "no .bac backup");
+    assert_eq!(read_pixels(&base, "/")?, before, "in-place repack changed pixels");
+    assert_eq!(read_pixels(&format!("{}.bac", base), "/")?, before, "backup differs");
+
+    // a wrong assembly must be refused: the chromsizes fingerprint as hg38
+    let e = repack(&base, RepackOpts { out: Some(p("bad.cool")), backup: false,
+        assembly: Some("hg19".into()), comp: Comp::parse("gzip1")?, nthreads: 2,
+        mem_gb: 8.0, expected: false }, false).unwrap_err();
+    assert!(e.to_string().contains("contradicts"), "unexpected: {}", e);
+    assert!(!std::path::Path::new(&p("bad.cool")).exists());
+
     std::fs::remove_dir_all(d).ok();
     Ok(())
 }

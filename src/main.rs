@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use rooler::{balance, cload, cooler, expected, merge, zoomify};
+use rooler::{balance, cload, cooler, expected, merge, repack, zoomify};
 
 #[derive(Parser)]
 #[command(name = "rooler", about = "Fast out-of-core cooler engine")]
@@ -48,6 +48,8 @@ enum Cmd {
         #[arg(long, alias = "nproc", default_value = "8")] threads: usize,
         /// RAM budget in GB for the balancing passes (scratch spills to disk-backed mmap beyond it)
         #[arg(long, default_value = "8.0")] mem: f64,
+        /// skip the expected computation that otherwise follows each --balance pass
+        #[arg(long)] no_expected: bool,
     },
     /// Balance a cooler (genome-wide IC); writes bins/weight
     Balance {
@@ -63,11 +65,29 @@ enum Cmd {
         #[arg(long)] block: Option<i64>,
         /// RAM budget in GB; the scratch spills to a disk-backed mmap beyond it (same results)
         #[arg(long, default_value="8.0")] mem: f64,
+        /// skip the expected computation that otherwise follows balancing
+        #[arg(long)] no_expected: bool,
     },
     /// Compute + store cis expected P(s) per region (arms/chroms)
     Expected {
         uri: String,
         #[arg(long)] view: Option<String>,
+    },
+    /// Rewrite a cooler/mcool with rooler defaults: parallel gzip, assembly stamped + verified,
+    /// balanced if it has no weights, expected computed. In place unless --out.
+    Repack {
+        src: String,
+        /// write here instead of replacing the source in place
+        #[arg(long, conflicts_with = "backup")] out: Option<String>,
+        /// keep the original at <src>.bac
+        #[arg(long)] backup: bool,
+        #[arg(long)] assembly: Option<String>,
+        #[arg(long, default_value = "gzip4")] preset: String,
+        #[arg(long, alias = "nproc", default_value = "8")] threads: usize,
+        /// RAM budget in GB for a balancing pass, if one is needed
+        #[arg(long, default_value = "8.0")] mem: f64,
+        /// skip the expected computation
+        #[arg(long)] no_expected: bool,
     },
     /// internal: write a tiny test cooler
     TestWrite { out: String, #[arg(long, default_value="0")] variant: i32 },
@@ -103,16 +123,24 @@ fn main() -> Result<()> {
             cload::cload(&pairs, binsize, &out, mem, threads, cooler::Comp::parse(&preset)?, &tmp,
                 assembly.as_deref(), !zero_based, true)?;
         }
-        Cmd::Zoomify { src, out, resolutions, preset, assembly, balance, threads, mem } => {
+        Cmd::Zoomify { src, out, resolutions, preset, assembly, balance, threads, mem, no_expected } => {
             zoomify::zoomify_and_balance(&src, &out, resolutions, cooler::Comp::parse(&preset)?,
-                assembly.as_deref(), balance, threads, mem, true)?;
+                assembly.as_deref(), balance, threads, mem, !no_expected, true)?;
         }
-        Cmd::Balance { uri, ignore_diags, mad_max, min_nnz, min_count, tol, max_iters, threads, block, mem } => {
+        Cmd::Balance { uri, ignore_diags, mad_max, min_nnz, min_count, tol, max_iters, threads, block, mem, no_expected } => {
             balance::balance(&uri, balance::Params{ignore_diags, mad_max, min_nnz, min_count, tol,
                 max_iters, nthreads: threads, tiled_block: block, mem_gb: mem}, true)?;
+            // expected is on by default once weights exist (per-organism default view);
+            // an unknown genome warns instead of failing the balance that just succeeded
+            if !no_expected { expected::expected_or_warn(&uri, true); }
         }
         Cmd::Expected { uri, view } => {
             expected::expected(&uri, view.as_deref(), true)?;
+        }
+        Cmd::Repack { src, out, backup, assembly, preset, threads, mem, no_expected } => {
+            repack::repack(&src, repack::RepackOpts {
+                out, backup, assembly, comp: cooler::Comp::parse(&preset)?,
+                nthreads: threads, mem_gb: mem, expected: !no_expected }, true)?;
         }
         Cmd::TestWrite { out, variant } => {
             let names = vec!["chrA".to_string(), "chrB".to_string()];

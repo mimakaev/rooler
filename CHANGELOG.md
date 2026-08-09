@@ -3,6 +3,18 @@
 ## Unreleased
 
 ### Added
+- **Expected is computed by default whenever weights are written** — after `balance`, after
+  each level of `zoomify --balance`, and in `repack`. One O(nnz) pass + FFT, with the
+  per-organism default view (arms for hg38/hg19/sacCer3, whole chromosomes for mm10/mm39/dm6/
+  ce11 and others); an unknown genome warns and skips instead of failing the parent op.
+  `--no-expected` opts out. Departure from cooler, on purpose: this is the quantity everyone
+  recomputes with cooltools at default parameters anyway, at 100–1000× the cost.
+- **New op: `rooler repack <cool|mcool>`** — rewrite an existing cooler the way rooler would
+  have written it: parallel-gzip preset (plugin-free, smaller), genome assembly stamped **and
+  verified against the chromosome-size fingerprint** (`repack --assembly hg19` on an hg38 file
+  is refused), balanced if it carries no weights (weights and their attrs are carried over
+  otherwise), expected stored. In place by default via atomic tmp+rename; `--backup` keeps the
+  original at `<src>.bac`; `--out` writes elsewhere.
 - **`balance` now honors a `--mem` budget (default 8 GB) and is no longer RAM-only.** When the
   estimated compressed scratch plus working vectors exceed the budget, the scratch blobs are
   written to an unlinked temp file next to the cooler and mmap'd read-only instead of held on
