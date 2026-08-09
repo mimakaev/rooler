@@ -146,14 +146,19 @@ impl crate::merge::BlockSource for CoolerPix {
     }
 }
 
+/// Where appended pixels go. Gzip gets the parallel direct-chunk path (deflate is single-threaded
+/// inside HDF5 and dominates `--compat` writes); blosc/none keep HDF5's own write path.
+enum PixSink {
+    Hdf5 { d1: hdf5::Dataset, d2: hdf5::Dataset, dc: hdf5::Dataset },
+    Par { c1: crate::parwrite::ParColumn, c2: crate::parwrite::ParColumn, cc: crate::parwrite::ParColumn },
+}
+
 /// Streaming writer: append (bin1,bin2,count) blocks in ascending-bin1 order; bounded RAM.
 /// Writes into a target group (root "/" for a flat .cool, "resolutions/{res}" for an mcool).
 pub struct CoolWriter {
     _f: File,      // keep the file handle alive
     g: Group,      // target group
-    d1: hdf5::Dataset,
-    d2: hdf5::Dataset,
-    dc: hdf5::Dataset,
+    pix: PixSink,
     nbins: usize,
     chrom_offset: Vec<i64>,
     bincount: Vec<i64>,
@@ -217,15 +222,32 @@ impl CoolWriter {
         build_i32(&gb, "start", &starts, comp)?;
         build_i32(&gb, "end", &ends, comp)?;
 
-        // pixels (resizable, streaming)
+        // pixels (resizable, streaming). gzip uses 256K-element chunks (the parallel-writer
+        // sweet spot: 64K-256K is fastest AND compresses better than cooler's ~60KB default);
+        // blosc keeps 1M-element chunks, which its own path handles well.
         let gp = g.create_group("pixels")?;
-        let chunk = 1usize << 20;
-        let d1 = res_i64(&gp, "bin1_id", chunk, comp)?;
-        let d2 = res_i64(&gp, "bin2_id", chunk, comp)?;
-        let dc = res_i32(&gp, "count", chunk, comp)?;
+        let pix = match comp {
+            Comp::Gzip(level) => {
+                use crate::parwrite::ParColumn;
+                let chunk = 1usize << 18;
+                PixSink::Par {
+                    c1: ParColumn::new(res_i64(&gp, "bin1_id", chunk, comp)?, 8, chunk, level),
+                    c2: ParColumn::new(res_i64(&gp, "bin2_id", chunk, comp)?, 8, chunk, level),
+                    cc: ParColumn::new(res_i32(&gp, "count", chunk, comp)?, 4, chunk, level),
+                }
+            }
+            _ => {
+                let chunk = 1usize << 20;
+                PixSink::Hdf5 {
+                    d1: res_i64(&gp, "bin1_id", chunk, comp)?,
+                    d2: res_i64(&gp, "bin2_id", chunk, comp)?,
+                    dc: res_i32(&gp, "count", chunk, comp)?,
+                }
+            }
+        };
 
         Ok(CoolWriter {
-            _f: file.clone(), g, d1, d2, dc, nbins, chrom_offset: chrom_offset.to_vec(),
+            _f: file.clone(), g, pix, nbins, chrom_offset: chrom_offset.to_vec(),
             bincount: vec![0i64; nbins], nnz: 0, last_bin1: -1,
         })
     }
@@ -239,15 +261,26 @@ impl CoolWriter {
         }
         self.last_bin1 = bin1[n - 1];
         let (lo, hi) = (self.nnz, self.nnz + n);
-        self.d1.resize([hi])?; self.d1.write_slice(&arr1(bin1), s![lo..hi])?;
-        self.d2.resize([hi])?; self.d2.write_slice(&arr1(bin2), s![lo..hi])?;
-        self.dc.resize([hi])?; self.dc.write_slice(&arr1(count), s![lo..hi])?;
+        match &mut self.pix {
+            PixSink::Hdf5 { d1, d2, dc } => {
+                d1.resize([hi])?; d1.write_slice(&arr1(bin1), s![lo..hi])?;
+                d2.resize([hi])?; d2.write_slice(&arr1(bin2), s![lo..hi])?;
+                dc.resize([hi])?; dc.write_slice(&arr1(count), s![lo..hi])?;
+            }
+            PixSink::Par { c1, c2, cc } => {
+                c1.push_i64(bin1)?; c2.push_i64(bin2)?; cc.push_i32(count)?;
+            }
+        }
         for &b in bin1 { self.bincount[b as usize] += 1; }
         self.nnz = hi;
         Ok(())
     }
 
-    pub fn close(self) -> Result<()> {
+    pub fn close(mut self) -> Result<()> {
+        // flush the parallel writer's tail (partial chunk) before the index/attrs are written
+        if let PixSink::Par { c1, c2, cc } = &mut self.pix {
+            c1.finish()?; c2.finish()?; cc.finish()?;
+        }
         let mut bin1_offset = vec![0i64; self.nbins + 1];
         let mut acc = 0i64;
         for i in 0..self.nbins { bin1_offset[i] = acc; acc += self.bincount[i]; }

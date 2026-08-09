@@ -10,3 +10,46 @@
   - matches the pre-plan measurement (27s build / 48s total) within noise.
 - Disk: /workspace 1.2T free.
 - Note: `/usr/bin/time` is not installed in this container; used rooler's own timing lines.
+
+## Phase 1 (2026-08-09)
+- Build warning-free; 26 unit tests pass.
+- Regression checks: balance on plan_base.cool unchanged (`converged=true cv=7.52e-5 scale=461.0`,
+  50s); cload of the 5M-pair subset @100kb -> **248,914 pixels**, matching the historical
+  reference exactly.
+- New guard rails verified by hand: `--preset gizp4` / `gzip99` / `blosc:snappy:1` all error;
+  merging coolers with different chrom names errors naming the file and the first difference;
+  a pairs line with an unknown chromosome errors instead of panicking.
+
+## Phase 2 (2026-08-09)
+- Test suite 3 -> **29 tests, 0.6s** (26 unit + 3 integration). No python/network/fixtures.
+- Found and fixed a *test* bug worth remembering: dropping only the `File` handle is not enough
+  to release an HDF5 file — a live `Group`/`Dataset` keeps it open, so the next op's read-write
+  open fails with a confusing `H5Fcreate: file exists`. All in-process handle use must be scoped.
+- `scripts/validate_vs_cooler.py` cross-check: cload with `blosc:zstd:1` vs `gzip4` produce
+  byte-identical pixel tables, and the files read through python `cooler` (fetch + symmetry).
+
+## Phase 3 — parallel gzip writer (2026-08-09)
+FFI smoke test passed first try: `H5Dwrite_chunk` (hdf5-metno-sys 0.10.1) + libdeflater zlib,
+chunks compressed on rayon threads, all HDF5 calls on the caller's thread. Verified the written
+chunks round-trip through the ordinary HDF5 API and that the dataset advertises the same
+SHUFFLE+DEFLATE pipeline as HDF5's own write path (so stock cooler/h5py read it, no plugins).
+
+Benchmark — single-input merge (a pure 1.1B-pixel re-write), `e2e/base.cool`, 8 threads:
+
+| preset | wall | user | output size |
+|---|---|---|---|
+| gzip4 **before** (HDF5 serial deflate) | **100s** | 1m56 | 820.9 MB |
+| gzip4 **after** (parallel direct-chunk) | **26s** | 2m24 | **786.1 MB** |
+| blosc:zstd:1 (default, unchanged path) | 26s | 0m40 | 1227.5 MB |
+| none (read+merge floor) | 24s | 0m29 | 22378 MB |
+
+- **3.8x faster** on the gzip path, and the file is **4.2% smaller** (256K-element chunks
+  compress better than the 1M chunk the serial path used — matches the prototype's finding).
+- Pixel-identical to the serial-gzip output (all 1.118B pixels, bins, indexes, attrs) and
+  cooler-readable; both files are plain gzip+shuffle, differing only in chunk size.
+- **gzip compat is now free**: same wall time as blosc:zstd:1 while producing a **36% smaller**
+  file. Costs ~5.5 cores vs blosc's ~1.5.
+- **merge is no longer write-bound**: gzip 26s / blosc 26s vs a 24s uncompressed floor, i.e.
+  within 8% of the read+merge path itself. Further write optimization (P3.5 blosc direct-chunk)
+  would buy ~nothing for merge; the remaining cost is the k-way merge/read side.
+- Scales: the 2.56B-pixel cooler re-writes with gzip4 in **64s** (5.9 GB out).
