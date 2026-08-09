@@ -112,9 +112,46 @@ fn open_res<'a>(f: &'a File, res: Option<&str>) -> Result<Group> {
     }
 }
 
+/// Refuse cooler variants rooler would otherwise mis-handle silently.
+///
+/// rooler assumes the common shape: symmetric-upper storage, fixed-width bins, integer counts.
+/// Everything else is legal cooler, and reading it anyway would corrupt data rather than fail —
+/// below-diagonal pixels get double-counted by the symmetric kernels and relabelled
+/// "symmetric-upper" on write, and float counts get truncated to int32. So check up front.
+pub fn check_supported(g: &Group) -> Result<()> {
+    // cooler writes these as variable-length UTF-8, rooler as ASCII; accept either, and a
+    // fixed-length string too. Failing to read the attribute must not look like "absent".
+    let sattr = |n: &str| -> Option<String> {
+        let a = g.attr(n).ok()?;
+        if let Ok(v) = a.read_scalar::<hdf5::types::VarLenUnicode>() { return Some(v.as_str().to_string()); }
+        if let Ok(v) = a.read_scalar::<hdf5::types::VarLenAscii>() { return Some(v.as_str().to_string()); }
+        if let Ok(v) = a.read_scalar::<hdf5::types::FixedAscii<64>>() { return Some(v.as_str().to_string()); }
+        None
+    };
+    match sattr("storage-mode").as_deref() {
+        None | Some("symmetric-upper") => {}
+        Some(m) => bail!("storage-mode {:?} is not supported (rooler assumes symmetric-upper, \
+                          i.e. only the upper triangle is stored). Reading it would double-count \
+                          the pixels below the diagonal.", m),
+    }
+    match sattr("bin-type").as_deref() {
+        None | Some("fixed") => {}
+        Some(t) => bail!("bin-type {:?} is not supported; rooler needs fixed-width bins", t),
+    }
+    if let Ok(d) = g.dataset("pixels/count") {
+        let td = d.dtype()?.to_descriptor()?;
+        if !matches!(td, hdf5::types::TypeDescriptor::Integer(_) | hdf5::types::TypeDescriptor::Unsigned(_)) {
+            bail!("pixels/count has dtype {} ; rooler stores integer counts and would truncate \
+                   fractional values. Round or rescale them first.", td);
+        }
+    }
+    Ok(())
+}
+
 pub fn read_meta(path: &str, res: Option<&str>) -> Result<Meta> {
     let f = File::open(path)?;
     let g = open_res(&f, res)?;
+    check_supported(&g)?;
     let raw = g.dataset("chroms/name")?.read_1d::<FixedAscii<64>>()
         .or_else(|_| g.dataset("chroms/name")?.read_1d::<FixedAscii<8>>().map(|a| a.mapv(|x| FixedAscii::<64>::from_ascii(x.as_bytes()).unwrap())))?;
     let names: Vec<String> = raw.iter().map(|s| s.to_string()).collect();
@@ -340,6 +377,37 @@ impl CoolWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Cooler variants rooler cannot handle must be refused, not silently mis-read: a square
+    /// cooler would have its below-diagonal pixels double-counted and then be relabelled
+    /// symmetric-upper, and float counts would be truncated to int32.
+    #[test]
+    fn unsupported_cooler_variants_are_refused() {
+        let d = tmpdir("supported");
+        let names = vec!["chrA".to_string()];
+        // a normal rooler cooler passes
+        let p = d.join("ok.cool");
+        {
+            let mut w = CoolWriter::create(p.to_str().unwrap(), &names, &[100], 10, 10, &[0, 10],
+                Comp::None, "test").unwrap();
+            w.append(&[0], &[1], &[3]).unwrap();
+            w.close().unwrap();
+        }
+        {
+            let f = File::open(p.to_str().unwrap()).unwrap();
+            check_supported(&f.group("/").unwrap()).expect("a plain rooler cooler must pass");
+        }
+        // flip storage-mode to "square" -> refused, naming the mode
+        {
+            let f = File::append(p.to_str().unwrap()).unwrap();
+            let g = f.group("/").unwrap();
+            g.attr("storage-mode").unwrap().write_scalar(
+                &hdf5::types::VarLenAscii::from_ascii("square").unwrap()).unwrap();
+            let e = check_supported(&g).unwrap_err().to_string();
+            assert!(e.contains("square") && e.contains("symmetric-upper"), "{}", e);
+        }
+        std::fs::remove_dir_all(&d).ok();
+    }
 
     #[test]
     fn comp_parse_accepts_valid_presets() {

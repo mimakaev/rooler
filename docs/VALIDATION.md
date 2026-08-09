@@ -63,7 +63,10 @@ own data — no network, no fixtures, no reference files.
 - **Guard rails**: mystery coolers refused, mismatched merges refused, out-of-range pairs
   positions refused, counts saturating rather than wrapping, `expected` on an unbalanced cooler
   refused, `ooe` across a region boundary refused.
-- **`repack`**: rewrites in place and to `--out`, preserving the pixel table and weights.
+- **`repack`**: rewrites in place and to `--out`, preserving the pixel table, the weights, and
+  any extra `bins/` columns (checked against a cooler carrying `GC` and a non-default weight).
+- **Unsupported variants refused**: a `storage-mode: square` cooler is rejected by name rather
+  than silently mis-read.
 
 ---
 
@@ -83,10 +86,16 @@ These prove the pipeline runs and stays inside its memory budget. They are not c
 
 Be appropriately suspicious of these.
 
+**Not supported, and refused with an explanatory error** (each verified against a cooler built
+by `cooler` itself with that feature):
+- **Asymmetric (`storage-mode: square`) coolers.** The kernels assume the upper triangle.
+- **Variable-width bins (`bin-type: variable`).**
+- **Float counts.** rooler stores `int32` and would truncate them.
+
 **Not implemented at all**
 - **Trans expected.** `expected` is cis-only; `ooe` therefore refuses trans fetches.
-- **KR balancing.** Only iterative correction.
-- **Variable-width bins.** Fixed binsize only.
+- **KR balancing.** Only iterative correction; no cis-only or per-chromosome variants.
+- **`.scool`** (single-cell) files.
 - **`.pairs` fields beyond chrom/pos.** No filtering on strand, pair type or mapping quality —
   do that upstream (e.g. with `pairtools`).
 

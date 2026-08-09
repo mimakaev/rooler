@@ -188,11 +188,41 @@ analyses actually want: `r.expected()` and `r.ooe()` both default to it, exactly
 
 ## Limitations
 
-Only the core options have been ported. 
+rooler handles the shape of cooler that a Hi-C/micro-C pipeline produces. Other legal cooler
+variants are **refused with an explanatory error**, not silently mis-read:
 
-* No asymmetric coolers
-* No trans-only or cis-only balancing
+| cooler feature | rooler |
+|---|---|
+| `storage-mode: symmetric-upper` | **yes** — the only mode supported |
+| `storage-mode: square` (asymmetric) | refused. The kernels assume the upper triangle, so below-diagonal pixels would be double-counted and the result relabelled symmetric-upper |
+| `bin-type: fixed` | **yes** |
+| `bin-type: variable` (non-uniform bins) | refused |
+| integer counts | **yes**, stored `int32`, saturating with a warning |
+| float counts | refused — they would be truncated. Round or rescale first |
+| extra `bins/` columns (GC, mappability, alternative weights) | preserved by `repack`; ignored by the other ops |
+| `.mcool` | **yes** |
+| `.scool` (single-cell) | not supported |
 
+Other limits worth knowing:
+
+- **Only cis expected.** No trans expected, so `ooe` refuses trans fetches.
+- **Only iterative correction.** No KR balancing, no cis-only balancing, no per-chromosome
+  weights; weights are written to `bins/weight` under that name.
+- **No pair filtering.** `cload` reads chrom/pos and ignores strand, pair type and mapping
+  quality — filter upstream (e.g. with `pairtools`).
+- **Chromosomes cap at 2.1 Gb** and chromosome names at 64 bytes (cooler's own coordinate limit).
+- **`balance` is the one op that is not streaming.** It respects `--mem` (default 8 GB),
+  building its compressed matrix (~2.5 B/pixel) in RAM when it fits and in a disk-backed memory
+  map beside the cooler when it does not — identical results either way, with committed memory
+  staying near the budget. Far beyond RAM it becomes disk-bandwidth-bound rather than
+  impossible. It has not been run at 100-billion-pixel scale.
+- **Iterative correction can plateau** without converging on very sparse or disconnected
+  matrices; it reports `converged=false` rather than pretending otherwise.
+- **`expected`'s built-in views** cover a short list of genomes, with centromere positions for
+  hg38, hg19 and sacCer3 only (approximate). Anything else needs an explicit `--view`.
+- **Linux x86-64, libhdf5 ≥ 1.10.3.** Nothing else has been built or tested.
+
+[docs/VALIDATION.md](docs/VALIDATION.md) records exactly what has been checked and what has not.
 
 ## Validation
 
@@ -237,20 +267,6 @@ read it, so gzip is the default and `--preset blosc:zstd:1` is there for private
 Off the HDF5 page, the internal formats are rooler's own: spill runs and the balance scratch
 use delta + byte-shuffle + LZ4 encodings (~1.9 B/key spill, ~2.5 B/pixel scratch) built to be
 decoded inside the compute loop.
-
-## Status and limits
-
-Working: all five ops, the Python read API, assembly enforcement. Known limits:
-
-- **`balance` respects a `--mem` budget (default 8 GB).** It builds a compressed matrix
-  (~2.5 bytes per pixel) in RAM when it fits, and in a disk-backed memory map next to the
-  cooler when it doesn't — identical results, and committed memory stays small either way
-  (a 2.5-billion-pixel balance peaks at ~2.4 GB of anonymous RSS under an 8 GB budget). Far
-  beyond RAM the cost is re-reading the scratch from NVMe each iteration, so very deep
-  balances become disk-bandwidth-bound rather than impossible.
-- Chromosomes are capped at 2.1 Gb (same limit as cooler).
-- Iterative correction can plateau without converging on very sparse or disconnected matrices;
-  it reports `converged=false` rather than pretending.
 
 ## Development
 

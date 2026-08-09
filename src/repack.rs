@@ -84,6 +84,7 @@ pub fn repack(src: &str, o: RepackOpts, log: bool) -> Result<()> {
             w.close()?;
             let dg = if group == "/" { f.group("/")? } else { f.group(&group)? };
             had_weight[ri] = copy_weight(&sg, &dg)?;
+            copy_extra_bin_columns(&sg, &dg)?;
             if log { eprintln!("  repack: {} rewritten ({} pix{}) {:.0}s",
                 res.as_deref().map(|r| format!("{}bp", r)).unwrap_or_else(|| "cooler".into()),
                 n, if had_weight[ri] { ", weights carried" } else { "" }, t0.elapsed().as_secs_f64()); }
@@ -114,6 +115,29 @@ pub fn repack(src: &str, o: RepackOpts, log: bool) -> Result<()> {
         if o.expected { crate::expected::expected_or_warn(&uri, log); }
     }
     if log { eprintln!("  repack DONE: {} in {:.0}s", final_path, t0.elapsed().as_secs_f64()); }
+    Ok(())
+}
+
+/// Copy any bins/* column the writer does not create itself (GC content, mappability, extra or
+/// alternatively-named weights). repack rewrites in place by default, so dropping them would be
+/// silent data loss on exactly the files repack exists for — ones made by other tools.
+fn copy_extra_bin_columns(sg: &hdf5::Group, dg: &hdf5::Group) -> Result<()> {
+    let sb = sg.group("bins")?;
+    let db = dg.group("bins")?;
+    for name in sb.member_names()? {
+        if matches!(name.as_str(), "chrom" | "start" | "end" | "weight") { continue; }
+        let sd = match sb.dataset(&name) { Ok(d) => d, Err(_) => continue };
+        let n = sd.shape()[0];
+        let mk = |b: hdf5::DatasetBuilderEmpty| b.shape([n]).shuffle().deflate(4);
+        if let Ok(v) = sd.read_1d::<f64>() {
+            mk(db.new_dataset::<f64>()).create(name.as_str())?.write(&v)?;
+        } else if let Ok(v) = sd.read_1d::<i64>() {
+            mk(db.new_dataset::<i64>()).create(name.as_str())?.write(&v)?;
+        } else {
+            eprintln!("  repack: WARNING bins/{} has a type this build cannot copy; \
+                       it is NOT carried into the output", name);
+        }
+    }
     Ok(())
 }
 

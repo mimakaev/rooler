@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Fixed — silent mis-handling of other cooler flavours
+Testing rooler against coolers built by `cooler` with each of its schema options found three
+cases that were accepted and quietly corrupted rather than refused:
+- **Asymmetric (`storage-mode: square`) coolers** were read as symmetric-upper, so pixels below
+  the diagonal were double-counted by the kernels, and the output was relabelled
+  `symmetric-upper` while still containing them.
+- **Float counts** were truncated to `int32` with no warning (5.5 -> 5).
+- **Variable-width bins** failed deep inside HDF5 with `no conversion paths found`.
+All three are now refused up front with an error naming the feature. Checking the attributes
+also exposed why the first guard did not fire at first: cooler writes `storage-mode`/`bin-type`
+as variable-length UTF-8 while rooler writes ASCII, so the read failed and looked like an
+absent attribute; both encodings are now accepted.
+
+**`repack` no longer drops extra `bins/` columns.** It rewrites in place by default, so
+discarding a file's `GC`, mappability or alternatively-named weight columns was silent data
+loss on exactly the files repack exists for. They are now carried through.
+
 Repository prepared for sharing: development scaffolding (`PLAN.md`, `PLAN_LOG.md`,
 `PROGRESS.md`, `RUN_PLAN.md`, `STATUS.md`), one-off experiment scripts and a stale compression
 example are gone; the benchmark scripts no longer hardcode absolute paths. Added

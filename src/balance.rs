@@ -37,6 +37,7 @@ pub fn balance(uri: &str, p: Params, log: bool) -> Result<()> {
     let (path, grp) = match uri.split_once("::") { Some((a, b)) => (a.to_string(), b.to_string()), None => (uri.to_string(), "/".to_string()) };
     let f = File::append(&path)?;
     let g = if grp == "/" { f.group("/")? } else { f.group(&grp)? };
+    crate::cooler::check_supported(&g)?;
     // probe sizes (dataset shapes only) to route the kernel and place the scratch
     let nbins_probe = g.dataset("bins/start")?.shape()[0];
     let nnz_probe = g.dataset("pixels/count")?.shape()[0];
