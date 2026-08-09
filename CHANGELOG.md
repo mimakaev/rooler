@@ -43,6 +43,16 @@ performance regression).
 - **`Rooler.expected(view=None, column=None)`** returns it as a DataFrame in cooltools' layout,
   with `contact_frequency` defaulting to the smoothed genome-wide curve — the same default
   cooltools uses. `Rooler.expected_views()` lists the stored views.
+- **`Rooler.ooe(region1, region2=None)`** — observed/expected, dividing balanced counts by the
+  stored expected at each cell's genomic separation. A fetch crossing an arm or chromosome
+  boundary (or a trans fetch) **raises** rather than quietly returning NaN: no single P(s)
+  applies to it. Regions may be named directly (`r.ooe("chr1_p")`) as well as given as
+  coordinates. Costs ~12–25% on top of a balanced fetch — the expected matrix is Toeplitz, so
+  it is built as a zero-copy strided view and divided in place.
+- **`Rooler` is a context manager** with `.close()`. The handle is read-only but holds a file
+  descriptor, and while it is alive HDF5 refuses to reopen that file for writing in the same
+  process. Note the caches (bin table on open; weights and expected lazily) live on the handle,
+  so a long-lived handle is usually what you want — `with` is for scoping around writes.
 
 ### Fixed
 - **`.pairs` positions are now read as 1-based** (the 4DN spec, and cooler's default), i.e.

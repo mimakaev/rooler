@@ -88,14 +88,35 @@ rooler repack old.mcool --backup --assembly hg38
 
 ```python
 import rooler
-r = rooler.open("merged.mcool", 1000)
+r = rooler.open("merged.mcool", 1000)     # open once, reuse — see below
 
 r.raw("chr1:5,000,000-6,000,000")        # dense raw counts
 r.balanced("chr1", "chr2")               # balanced, trans
+r.ooe("chr1_p")                          # observed / expected, cis
+r.expected()                             # P(s) table, smoothed by default
 r.matrix(balance=True).fetch("chr17")    # cooler-compatible form
-
-r.expected()                             # P(s), smoothed by default
 ```
+
+**Keep the handle open.** Opening a `Rooler` reads and caches everything a fetch needs — chrom
+names and lengths, chrom offsets, the whole `bin1_offset` index — and lazily caches the
+balancing weights and the expected table on first use. Re-opening per fetch re-reads all of
+that and discards the caches. Open once, hold it, fetch many times.
+
+The handle is read-only but still a resource: it holds a file descriptor, and while it is alive
+HDF5 will not let anything in the same process reopen that file for **writing** — so an
+in-process `rooler` op on it would fail. `Rooler` is therefore a context manager with a
+`.close()`; use `with` when you're about to write to the same file, or in a long-running
+process opening many coolers:
+
+```python
+with rooler.open("merged.mcool", 1000) as r:
+    oe = r.ooe("chr2_q")
+```
+
+`ooe()` divides balanced counts by the stored expected at each cell's genomic separation. Both
+sides must sit inside one region of the expected view — a fetch crossing an arm or chromosome
+boundary, or a trans fetch, **raises** rather than quietly returning NaN, because no single
+P(s) applies to it. It defaults to the smoothed genome-wide curve; `column=` picks another.
 
 Because the output is a real cooler, this also just works:
 
@@ -165,17 +186,18 @@ prefer, and rooler reads blosc coolers written by other tools.
 Validated against the reference implementations: `cload` output is **byte-identical** to
 `cooler cload` (verified on all 2.56 billion pixels of a real micro-C file); `merge` and
 `zoomify` are pixel-exact; `balance` picks the identical set of bins and its weights agree with
-`cooler.balance_cooler` to **2.5e-6** at matched tolerance; `expected` matches
-`cooltools.expected_cis` to machine precision (6.4e-16).
+`cooler.balance_cooler` to **2.5e-6** at matched tolerance; every `expected` column matches
+`cooltools.expected_cis` to **2.4e-15**.
 
 `.pairs` coordinates are read as **1-based**, per the 4DN spec and cooler's default; pass
 `--zero-based` for a file that genuinely is not.
 
 `expected` stores the same columns `cooltools.expected_cis` returns — `n_total`, `n_valid`,
-`count.sum/avg`, `balanced.sum/avg`, and the log-smoothed `balanced.avg.smoothed` and
-`balanced.avg.smoothed.agg` — all agreeing with cooltools to **2.4e-15**. `r.expected()`
-returns them as a DataFrame whose `contact_frequency` column defaults to the smoothed,
-genome-wide aggregated curve, matching cooltools' default; pass `column=` to choose another.
+`count.sum/avg`, `balanced.sum/avg`, and the log-smoothed `balanced.avg.smoothed` (per region)
+and `balanced.avg.smoothed.agg` (genome-wide), at cooltools' own smoothing defaults. A raw P(s)
+is noisy at large separations, where few pixel pairs contribute, so the smoothed curve is what
+analyses actually want: `r.expected()` and `r.ooe()` both default to it, exactly as
+`cooltools.expected_cis` does, and `column=` selects another.
 
 ## Tests
 

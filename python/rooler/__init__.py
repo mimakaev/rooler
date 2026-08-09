@@ -246,6 +246,21 @@ class Rooler:
         self._ecache[key] = (region_of, tables, names)
         return self._ecache[key]
 
+    def _view_region_bins(self, region, names, view):
+        """Bin range for a region string. A stored view-region name (e.g. 'chr1_p') resolves to
+        that region — the natural unit for ooe, and what the boundary error tells you to use —
+        otherwise it is parsed as a chromosome or 'chrom:start-end'."""
+        if isinstance(region, str) and region in names:
+            gv = self._g[f"views/{view}"]
+            rid = names.index(region)
+            c = gv["chrom"][rid]
+            c = c.decode() if isinstance(c, bytes) else c
+            base = self.chrom_offset[self._cid[c]]
+            b0 = base + int(gv["start"][rid]) // self.binsize
+            b1 = base + -(-int(gv["end"][rid]) // self.binsize)
+            return int(b0), int(b1)
+        return self._region_bins(region)
+
     def _one_region(self, rng, region_of, names, view, what):
         """The bin range must lie inside exactly one view region; otherwise explain why not."""
         lo, hi = rng
@@ -288,8 +303,9 @@ class Rooler:
             raise ValueError("ooe() needs a region, e.g. r.ooe('chr1:0-5,000,000')")
         vname = view if view is not None else (self.expected_views() or [None])[0]
         region_of, tables, names = self._expected_lookup(view, column)
-        a0, a1 = self._region_bins(region1)
-        b0, b1 = (a0, a1) if region2 is None else self._region_bins(region2)
+        a0, a1 = self._view_region_bins(region1, names, vname)
+        b0, b1 = ((a0, a1) if region2 is None
+                  else self._view_region_bins(region2, names, vname))
         ra = self._one_region((a0, a1), region_of, names, vname, f"region1 {region1!r}")
         rb = ra if region2 is None else self._one_region(
             (b0, b1), region_of, names, vname, f"region2 {region2!r}")
@@ -302,7 +318,7 @@ class Rooler:
         if curve is None:
             raise ValueError(f"no expected curve stored for region {names[ra]!r}")
 
-        obs = self._fetch_region(region1, region2, balance=True, sparse=False)
+        obs = self._fetch_bins(a0, a1, b0, b1, balance=True, sparse=False)
         # The expected matrix is Toeplitz (exp[i,j] = curve[|i-j|]), so build it as a zero-copy
         # strided view over a 1-D array of length na+nb-1 rather than materializing na*nb
         # values. ooe() then costs one divide pass over the observed matrix.
