@@ -1,4 +1,4 @@
-# rooler
+# rooler - a Rust rewrite of cooler
 
 **A fast, out-of-core engine for Hi-C / micro-C `.cool` files.**
 `cload` · `merge` · `zoomify` · `balance` · `expected` — plus a small Python read API.
@@ -8,9 +8,9 @@
 > you should spot-check results against `cooler` on your own data before trusting it.
 
 rooler is a reimplementation of the heavy part of the [cooler](https://github.com/open2c/cooler)
-CLI — the distiller-style pipeline `pairs → cload → merge → zoomify → balance` — aimed at the
-scale modern micro-C has reached: **tens to hundreds of billions of contacts, at 64–256 bp
-resolution, on a normal workstation**.
+CLI — the distiller-relevant pipeline `pairs → cload → merge → zoomify → balance` — aimed at the
+scale modern micro-C has reached: tens to hundreds of billions of contacts, at 64–256 bp
+resolution.
 
 It writes ordinary **cooler files**. `cooler`, `cooltools`, HiGlass and everything else in that
 ecosystem read rooler output directly, with no plugins and no conversion step.
@@ -95,10 +95,9 @@ with rooler.open("merged.mcool", 1000) as r:
     r.matrix(balance=True).fetch("chr17")  # cooler-compatible form
 ```
 
-**Keep the handle open.** Opening a `Rooler` reads and caches everything a fetch needs — chrom
+**Keep the handle open.** Unlike Cooler, opening a `Rooler` reads and caches everything a fetch needs — chrom
 names and lengths, chrom offsets, the whole `bin1_offset` index — and lazily caches the
-balancing weights and the expected table on first use. Re-opening per fetch re-reads all of
-that and discards the caches. Open once, hold it, fetch many times.
+balancing weights and the expected table on first use.
 
 `ooe()` divides balanced counts by the stored expected at each cell's genomic separation. Both
 sides must sit inside one region of the expected view — a fetch crossing an arm or chromosome
@@ -141,7 +140,7 @@ rooler repack  <cool|mcool>  [--out new.cool | --backup] [--assembly hg38] [--me
   the original), or to a new path with `--out`.
 
 Coming from cooler: `--nproc` works as an alias for `--threads`, and `--chunksize` maps onto
-the `--mem` budget.
+the `--mem` budget using typical cooler's consumption at a given --chunksize.
 
 ### Opinionated choices
 
@@ -149,21 +148,19 @@ the `--mem` budget.
 `--assembly`, or infer one from the chromsizes.
 
 **Expected comes built in.** In practice, people compute cis expected with cooltools at default
-parameters over chromosome arms — and wait hours-to-days for what is one O(nnz) pass. rooler
+parameters over chromosome arms — and wait minutes to hours for what is one O(nnz) pass. rooler
 computes it **by default whenever weights are written** (`balance`, `zoomify --balance`,
 `repack`), with a per-organism default view: arms where arms are meaningful (human, yeast),
 whole chromosomes where they are not (mouse, fly, worm).
 
 **Counts are `int32`.** Internal accumulators are 64-bit, but stored counts saturate at
-2,147,483,647 with a loud warning telling you how many pixels were affected — a value unlikely
-to represent a true pixel of a Hi-C map.
+2,147,483,647 — a value unlikely to represent a true pixel of a Hi-C map.
 
 ## Compatibility
 
 rooler writes ordinary cooler files: gzip-compressed with the same shuffle+deflate pipeline
 cooler itself uses, so every HDF5 reader on earth opens them with no filter plugins and no
-conversion — `cooler`, `cooltools`, HiGlass, plain `h5py`. It also reads blosc-compressed
-coolers written by other tools.
+conversion — `cooler`, `cooltools`, HiGlass, plain `h5py`. 
 
 `.pairs` coordinates are read as **1-based**, per the 4DN spec and cooler's default; pass
 `--zero-based` for a file that genuinely is not.
@@ -177,9 +174,9 @@ analyses actually want: `r.expected()` and `r.ooe()` both default to it, exactly
 
 ## Validation
 
-Against the reference implementations: `cload` output is **byte-identical** to `cooler cload`
-(verified on all 2.56 billion pixels of a real micro-C file); `merge` and `zoomify` are
-pixel-exact; `balance` picks the identical set of bins and its weights agree with
+Against the reference implementations: `cload` output is identical to `cooler cload`
+(verified on all 2.56 billion pixels of a real micro-C file) so are  `merge` and `zoomify`.
+`balance` picks the identical set of bins and its weights agree with
 `cooler.balance_cooler` to **2.5e-6** at matched tolerance; every `expected` column matches
 `cooltools.expected_cis` to **2.4e-15**.
 
@@ -217,8 +214,7 @@ read it, so gzip is the default and `--preset blosc:zstd:1` is there for private
 
 Off the HDF5 page, the internal formats are rooler's own: spill runs and the balance scratch
 use delta + byte-shuffle + LZ4 encodings (~1.9 B/key spill, ~2.5 B/pixel scratch) built to be
-decoded inside the compute loop, and `bins/chrom` is written as a proper HDF5 enum per the
-cooler schema.
+decoded inside the compute loop.
 
 ## Status and limits
 
