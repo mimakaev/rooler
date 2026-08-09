@@ -107,3 +107,38 @@ is unchanged; and phase B's cost is dominated by the single-thread k-way merge i
   it correctly reports `converged=false`. Dense/real data converges normally.
 - Tests: 39 (35 unit + 4 integration), including custom-BED parse/validation cases and
   `zoomify --balance` asserting a converged weight at every level.
+
+## Phase 6 — large-scale stretch test (2026-08-09)
+
+### Sizing: why 100B pairs and not 300B
+Disk math before starting (1.20 TB free on /workspace), using the measured 1.87 B/key spill and
+~2.2 B/pixel output, with pixels ≈ pairs at 64bp (the bin space is so large that nearly every
+pair lands on its own pixel):
+
+| pairs | spill | cooler | peak during cload |
+|---|---|---|---|
+| 300B | 0.56 TB | ~0.62 TB | **~1.18 TB = 98% of free — refused** |
+| 150B | 0.28 TB | ~0.31 TB | ~0.59 TB |
+| 100B | 0.19 TB | ~0.21 TB | ~0.40 TB (chosen; leaves room for the mcool too) |
+
+300B is **disk-limited on this box, not architecture-limited** — and the estimate is uncertain
+enough that a 10% miss would fill the volume mid-run. Ran 100B as the plan's fallback allows.
+(The synthetic stream actually compresses worse than real data: **2.83 B/key**, because its trans
+pairs are uniform and so delta-code poorly. Real spill was 1.87 B/key.)
+
+### Result: `genpairs 100e9 | rooler cload - 64 mega64.cool --mem 32 --threads 8`
+
+| | |
+|---|---|
+| input | **100,000,000,000 pairs** (streamed, never stored as text) |
+| output | **81,477,686,796 pixels** over **48,254,229 bins** at **64 bp**, hg38 |
+| phase A | 1787s — parse + bin + sort + spill, 205 runs, 56 Mpairs/s |
+| phase B | 5114s — ranged-parallel merge, **8 ranges x 8 threads even at 205 runs** |
+| total | **6901s (1h55m)** |
+| **peak RSS** | **29.8 GB** (with `--mem 32`) — comfortably inside a 64 GB budget |
+| file | 175.9 GB = **2.16 B/pixel** |
+
+- The SPILL_BLK 1M -> 128K change (P4) paid off exactly as intended: with 205 runs the memory
+  budget still allowed the full 8 parallel ranges. At 1M blocks the same budget would have
+  allowed only 6.
+- RAM is bounded by `--mem`, not by the data: 100B pairs and 48M bins ran in 30 GB.
