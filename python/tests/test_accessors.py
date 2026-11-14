@@ -44,6 +44,40 @@ def test_pixels_match_cooler(cool):
     r.close()
 
 
+def test_info_matches_cooler(cool):
+    """r.info is the file's attributes, i.e. cooler's own info dict — and a rooler-written
+    file must carry every key cooler's writer produces (`sum` and `nnz` included)."""
+    c, r = cooler.Cooler(cool), rooler.open(cool)
+    assert r.info == c.info
+    for key in ("bin-size", "bin-type", "creation-date", "format", "format-url",
+                "format-version", "generated-by", "genome-assembly", "metadata", "nbins",
+                "nchroms", "nnz", "storage-mode", "sum"):
+        assert key in r.info, key
+    assert r.info["sum"] == 2_000_000          # one count per generated pair
+    assert r.info["sum"] == int(c.pixels()["count"][:].sum())
+    assert r.info["nnz"] == len(c.pixels())
+    # balance flags are real booleans, as cooler writes them ("False" as a string is truthy)
+    import h5py
+    with h5py.File(cool, "r") as f:
+        attrs = dict(f["bins/weight"].attrs)
+    assert attrs["converged"] is np.True_ and attrs["cis_only"] is np.False_
+    assert not attrs["divisive_weights"]
+    r.close()
+
+
+def test_matrix_matches_cooler(cool):
+    """Dense fetches (cis square, trans, overlapping rectangles, bin slices) equal cooler's."""
+    c, r = cooler.Cooler(cool), rooler.open(cool)
+    for bal in (False, True):
+        cm, rm = c.matrix(balance=bal), r.matrix(balance=bal)
+        for args in (("chr2",), ("chr1", "chr3"), ("chr3", "chr1"),
+                     ("chr1:10,000,000-60,000,000", "chr1:40,000,000-90,000,000")):
+            assert np.allclose(cm.fetch(*args), rm.fetch(*args), equal_nan=True), (bal, args)
+        assert np.allclose(cm[10:60, 30:90], rm[10:60, 30:90], equal_nan=True)
+    assert np.array_equal(r.raw()[5:40, 5:40], c.matrix(balance=False)[5:40, 5:40])
+    r.close()
+
+
 def test_pixels_join_matches_cooler(cool):
     c, r = cooler.Cooler(cool), rooler.open(cool)
     want = c.pixels(join=True)[:2000].reset_index(drop=True)

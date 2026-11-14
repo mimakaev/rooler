@@ -124,16 +124,19 @@ fn full_pipeline_matches_oracles() -> Result<()> {
     // the spill dir must be cleaned up
     assert!(!std::path::Path::new(&tmp).exists(), "cload left its spill dir behind");
     // assembly was fingerprinted from chr1's length, not left blank
-    assert_eq!(rooler::cooler::read_meta(&base, None)?.assembly, "hg38");
+    assert_eq!(rooler::cooler::read_meta(&base, "/")?.assembly, "hg38");
 
     // ---- 2. merge: the same cooler twice -> every count doubled, same keys ----
     let merged = p("merged.cool");
-    merge::merge_coolers(&[base.clone(), base.clone()], None, &merged, 0.01,
+    merge::merge_coolers(&[base.clone(), base.clone()], "/", &merged, 0.01, 1,
         Comp::parse("blosc:zstd:1")?, None, false)?;
     assert_matches_oracle(&read_pixels(&merged, "/")?, &case.expect, 2, "merge(serial)");
+    // the `sum` attribute (cooler's Cooler.info["sum"]) is the total count, here 2 x the pairs
+    assert_eq!(hdf5::File::open(&merged)?.attr("sum")?.read_scalar::<i64>()?, 400_000, "merge sum attr");
+    assert_eq!(hdf5::File::open(&base)?.attr("sum")?.read_scalar::<i64>()?, 200_000, "cload sum attr");
     // ranged-parallel merge must agree with the serial one exactly
     let merged_par = p("merged_par.cool");
-    merge::merge_coolers_parallel(&[base.clone(), base.clone()], None, &merged_par, 0.01, 4,
+    merge::merge_coolers(&[base.clone(), base.clone()], "/", &merged_par, 0.01, 4,
         Comp::parse("blosc:zstd:1")?, None, false)?;
     assert_eq!(read_pixels(&merged_par, "/")?, read_pixels(&merged, "/")?, "parallel merge != serial merge");
 
@@ -302,9 +305,10 @@ fn zoomify_balance_covers_every_level() -> Result<()> {
         let w = read_f64(&mc, &g, "bins/weight")?;
         assert!(w.iter().any(|x| x.is_finite()), "{}bp has no finite weights", res);
         let f = hdf5::File::open(&mc)?;
-        let conv = f.group(&g)?.dataset("bins/weight")?.attr("converged")?
-            .read_scalar::<hdf5::types::VarLenAscii>()?;
-        assert_eq!(conv.as_str(), "True", "{}bp did not converge", res);
+        let conv = f.group(&g)?.dataset("bins/weight")?.attr("converged")?.read_scalar::<bool>()?;
+        assert!(conv, "{}bp did not converge", res);
+        // every level carries cooler's full info: total counts are conserved by coarsening
+        assert_eq!(f.group(&g)?.attr("sum")?.read_scalar::<i64>()?, 100_000, "{}bp sum attr", res);
         // expected is on by default after each balance; the hg38-fingerprinted test genome
         // resolves to the per-organism default view (arms)
         assert!(f.link_exists(&format!("{}/expected/arms/weight", g)),
@@ -350,14 +354,14 @@ fn ops_refuse_bad_input() -> Result<()> {
     // ... but an explicit assembly is accepted
     cload::cload(pairs.to_str().unwrap(), 100, &p("w.cool"), 0.01, 1,
         Comp::parse("none")?, &p("rw2"), Some("myGenome"), false, false)?;
-    assert_eq!(rooler::cooler::read_meta(&p("w.cool"), None)?.assembly, "myGenome");
+    assert_eq!(rooler::cooler::read_meta(&p("w.cool"), "/")?.assembly, "myGenome");
 
     // merging coolers with different bin layouts must error, not silently corrupt
     let pairs2 = dir.join("w2.pairs");
     std::fs::write(&pairs2, "#chromsize: scaffold_1 12345\n#chromsize: scaffold_2 999\nr\tscaffold_1\t1\tscaffold_1\t2\t+\t+\n")?;
     cload::cload(pairs2.to_str().unwrap(), 100, &p("w2.cool"), 0.01, 1,
         Comp::parse("none")?, &p("rw3"), Some("myGenome"), false, false)?;
-    let e = merge::merge_coolers(&[p("w.cool"), p("w2.cool")], None, &p("bad.cool"), 0.01,
+    let e = merge::merge_coolers(&[p("w.cool"), p("w2.cool")], "/", &p("bad.cool"), 0.01, 1,
         Comp::parse("none")?, Some("myGenome"), false).unwrap_err();
     assert!(e.to_string().contains("merge:"), "expected a merge mismatch error, got: {}", e);
 
@@ -458,9 +462,16 @@ fn repack_rewrites_carries_weights_and_verifies_assembly() -> Result<()> {
         assert!(f.link_exists("expected/arms/weight"), "repack did not write default expected");
         let filt = format!("{:?}", f.dataset("pixels/count")?.filters());
         assert!(filt.to_lowercase().contains("deflate"), "repack output not gzip: {}", filt);
-        let conv = f.dataset("bins/weight")?.attr("converged")?
-            .read_scalar::<hdf5::types::VarLenAscii>()?;
-        assert_eq!(conv.as_str(), "True", "weight attrs not carried");
+        // weight attributes keep their kind: a real boolean, and floats that are not truncated
+        let wd = f.dataset("bins/weight")?;
+        assert!(wd.attr("converged")?.read_scalar::<bool>()?, "weight attrs not carried");
+        assert!(matches!(wd.attr("converged")?.dtype()?.to_descriptor()?,
+            hdf5::types::TypeDescriptor::Boolean), "converged must be stored as a boolean");
+        assert_eq!(wd.attr("tol")?.read_scalar::<f64>()?, 1e-8, "float weight attr truncated");
+        let scale = |path: &str| -> Result<f64> {
+            Ok(hdf5::File::open(path)?.dataset("bins/weight")?.attr("scale")?.read_scalar::<f64>()?) };
+        assert_eq!(scale(&out)?, scale(&base)?, "scale attr changed in repack");
+        assert_eq!(f.attr("sum")?.read_scalar::<i64>()?, 30_000, "repack sum attr");
     }
 
     // in-place with --backup: original preserved at .bac, source replaced

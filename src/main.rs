@@ -89,8 +89,6 @@ enum Cmd {
         /// skip the expected computation
         #[arg(long)] no_expected: bool,
     },
-    /// internal: write a tiny test cooler
-    TestWrite { out: String, #[arg(long, default_value="0")] variant: i32 },
 }
 
 /// cooler-compat shim: `--chunksize C` with `--nproc N` implies roughly C*N*40 bytes of
@@ -113,9 +111,11 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Merge { out, inputs, res, mem, preset, assembly, threads, chunksize } => {
             let mem = resolve_mem(mem, chunksize, threads);
-            let paths: Vec<String> = inputs.iter().map(|s| s.split("::").next().unwrap().to_string()).collect();
-            let r = res.or_else(|| inputs[0].split("::").nth(1).map(|g| g.rsplit('/').next().unwrap().to_string()));
-            merge::merge_coolers_parallel(&paths, r.as_deref(), &out, mem, threads, cooler::Comp::parse(&preset)?, assembly.as_deref(), true)?;
+            // one group for every input: --res R, else the `::group` of the first input, else "/"
+            let grp = res.map(|r| format!("resolutions/{}", r))
+                .unwrap_or_else(|| cooler::split_uri(&inputs[0]).1);
+            let paths: Vec<String> = inputs.iter().map(|s| cooler::split_uri(s).0).collect();
+            merge::merge_coolers(&paths, &grp, &out, mem, threads, cooler::Comp::parse(&preset)?, assembly.as_deref(), true)?;
         }
         Cmd::Cload { pairs, binsize, out, mem, threads, preset, assembly, chunksize, zero_based } => {
             let mem = resolve_mem(mem, chunksize, threads);
@@ -141,18 +141,6 @@ fn main() -> Result<()> {
             repack::repack(&src, repack::RepackOpts {
                 out, backup, assembly, comp: cooler::Comp::parse(&preset)?,
                 nthreads: threads, mem_gb: mem, expected: !no_expected }, true)?;
-        }
-        Cmd::TestWrite { out, variant } => {
-            let names = vec!["chrA".to_string(), "chrB".to_string()];
-            let lengths = vec![35i64, 20]; let chrom_offset = vec![0i64, 4, 6];
-            let mut w = cooler::CoolWriter::create(&out, &names, &lengths, 10, 6, &chrom_offset,
-                cooler::Comp::parse("gzip4")?, "test")?;
-            if variant == 0 {
-                w.append(&[0, 0, 1], &[0, 3, 1], &[5, 2, 7])?; w.append(&[4], &[5], &[3])?;
-            } else {
-                w.append(&[0, 1, 4], &[3, 1, 5], &[10, 1, 100])?;
-            }
-            w.close()?; println!("wrote {}", out);
         }
     }
     Ok(())

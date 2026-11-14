@@ -89,11 +89,6 @@ fn log_smooth_pair(xs: &[f64], sum: &[f64], nval: &[f64]) -> (Vec<f64>, Vec<f64>
     (log_interp(xs, &thinned, &s_thin), log_interp(xs, &thinned, &v_thin))
 }
 
-fn stream_pixels(g: &hdf5::Group, block: usize, mut f: impl FnMut(&[i64], &[i64], &[i32])) -> Result<()> {
-    // parallel chunk decompression for gzip columns; serial fallback otherwise (parread.rs)
-    crate::parread::stream_pixels(g, block, |a, b, c| { f(a, b, c); Ok(()) })
-}
-
 /// Default-on path (balance/zoomify/repack): compute expected with the per-organism default
 /// view, but never fail the parent op over it — an unknown genome just warns and moves on.
 pub fn expected_or_warn(uri: &str, log: bool) {
@@ -104,17 +99,17 @@ pub fn expected_or_warn(uri: &str, log: bool) {
 
 pub fn expected(uri: &str, view_req: Option<&str>, log: bool) -> Result<()> {
     let t0 = std::time::Instant::now();
-    let (path, grp) = match uri.split_once("::") { Some((a, b)) => (a.to_string(), b.to_string()), None => (uri.to_string(), "/".to_string()) };
+    let (path, grp) = crate::cooler::split_uri(uri);
     let f = File::append(&path)?;
-    let g = if grp == "/" { f.group("/")? } else { f.group(&grp)? };
-    let meta = crate::cooler::read_meta(&path, if grp == "/" { None } else { Some(grp.rsplit('/').next().unwrap()) })?;
+    let g = f.group(&grp)?;
+    let meta = crate::cooler::read_meta(&path, &grp)?;
     let nbins = meta.nbins;
     if !g.link_exists("bins/weight") { return Err(anyhow!("cooler is not balanced (no bins/weight); run `rooler balance` first")); }
     let weight: Vec<f64> = g.dataset("bins/weight")?.read_1d::<f64>()?.to_vec();
     let ignore_diags = g.dataset("bins/weight")?.attr("ignore_diags").ok()
         .and_then(|a| a.read_scalar::<i64>().ok()).unwrap_or(2);
 
-    let chromsizes: Vec<(String, i64)> = meta.names.iter().cloned().zip(meta.lengths.iter().cloned()).collect();
+    let chromsizes = meta.chromsizes();
     let (view_name, regions) = view::resolve(&meta.assembly, &chromsizes, view_req)
         .map_err(|e| anyhow!("cannot determine expected regions: {}", e))?;
     let cid: std::collections::HashMap<&str, usize> = meta.names.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
@@ -146,7 +141,7 @@ pub fn expected(uri: &str, view_req: Option<&str>, log: bool) -> Result<()> {
     // streaming per-region, per-distance sums: balanced (count*w_i*w_j over valid pixels) and raw
     let mut sumb: Vec<Vec<f64>> = reg_len.iter().map(|&l| vec![0f64; l]).collect();
     let mut sumc: Vec<Vec<f64>> = reg_len.iter().map(|&l| vec![0f64; l]).collect();
-    stream_pixels(&g, 1 << 22, |ia, ja, ca| {
+    crate::parread::stream_pixels(&g, 1 << 22, |ia, ja, ca| {
         for k in 0..ia.len() {
             let (i, j) = (ia[k] as usize, ja[k] as usize);
             let (ri, rj) = (region_of[i], region_of[j]);
@@ -162,6 +157,7 @@ pub fn expected(uri: &str, view_req: Option<&str>, log: bool) -> Result<()> {
                 if rj.contains(&a) { sumc[a as usize][d] += c; sumb[a as usize][d] += b; }
             }
         }
+        Ok(())
     })?;
     if log { eprintln!("  expected: sum pass done ({} regions, view={}) {:.0}s", nreg, view_name, t0.elapsed().as_secs_f64()); }
 
@@ -237,8 +233,7 @@ pub fn expected(uri: &str, view_req: Option<&str>, log: bool) -> Result<()> {
     col("balanced.avg.smoothed", &o_sm)?;
     col("balanced.avg.smoothed.agg", &o_smagg)?;
     // what a consumer should use by default, mirroring cooltools' "contact_frequency"
-    ge.new_attr::<hdf5::types::VarLenAscii>().create("default_column")?
-        .write_scalar(&hdf5::types::VarLenAscii::from_ascii("balanced.avg.smoothed.agg")?)?;
+    crate::cooler::write_str_attr(&ge, "default_column", "balanced.avg.smoothed.agg")?;
     ge.new_attr::<f64>().create("smooth_sigma")?.write_scalar(&0.1f64)?;
     ge.new_attr::<i64>().create("ignore_diags")?.write_scalar(&ignore_diags)?;
     // store the view (regions)
@@ -246,21 +241,11 @@ pub fn expected(uri: &str, view_req: Option<&str>, log: bool) -> Result<()> {
     let gv = g.create_group(&format!("views/{}", view_name))?;
     let names: Vec<String> = regions.iter().map(|r| r.name.clone()).collect();
     let chroms: Vec<String> = regions.iter().map(|r| r.chrom.clone()).collect();
-    write_str(&gv, "name", &names)?; write_str(&gv, "chrom", &chroms)?;
+    crate::cooler::write_fixed_ascii(&gv, "name", &names)?;
+    crate::cooler::write_fixed_ascii(&gv, "chrom", &chroms)?;
     gv.new_dataset::<i64>().shape([nreg]).create("start")?.write(&ndarray::arr1(&regions.iter().map(|r| r.start).collect::<Vec<_>>()))?;
     gv.new_dataset::<i64>().shape([nreg]).create("end")?.write(&ndarray::arr1(&regions.iter().map(|r| r.end).collect::<Vec<_>>()))?;
     if log { eprintln!("  expected DONE: {} rows, view '{}' in {:.0}s", o_reg.len(), view_name, t0.elapsed().as_secs_f64()); }
-    Ok(())
-}
-
-fn write_str(g: &hdf5::Group, name: &str, vals: &[String]) -> Result<()> {
-    use hdf5::types::FixedAscii;
-    let ml = vals.iter().map(|s| s.len()).max().unwrap_or(1).max(1);
-    macro_rules! w { ($n:expr) => {{
-        let a: Vec<FixedAscii<$n>> = vals.iter().map(|s| FixedAscii::<$n>::from_ascii(s.as_bytes()).unwrap()).collect();
-        g.new_dataset::<FixedAscii<$n>>().shape([vals.len()]).create(name)?.write(&ndarray::arr1(&a))?;
-    }}}
-    match ml { 0..=16 => w!(16), 17..=32 => w!(32), _ => w!(64) }
     Ok(())
 }
 

@@ -3,7 +3,7 @@
 //! N worker threads each parse+bin+sort+spill their own runs. Phase B: k-way drain-and-count
 //! merge over all runs (count=1) -> writer. RAM bounded by --mem (N worker buffers of mem/N).
 use crate::cooler::{CoolWriter, Comp};
-use crate::merge::{merge_sources, merge_sources_to_writer, BlockSource, Counts};
+use crate::merge::{merge_ranges_to_writer, BlockSource, Counts};
 use anyhow::{anyhow, bail, Result};
 use crossbeam_channel::{bounded, Receiver};
 use lz4_flex::block::{compress, decompress};
@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write, BufWriter, BufReader};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Keys per compressed spill block. Smaller blocks mean smaller decode buffers, which keeps
 /// the ranged-parallel phase B parallel when there are many runs (resident RAM there is
@@ -42,8 +43,19 @@ pub struct Bins {
     pub one_based: bool,
 }
 
+/// Decimal digits -> integer. Anything else (empty, sign, letters, a stray '\r', more than 18
+/// digits) is None: a position that does not parse must fail the load, not land in some bin.
 #[inline]
-pub fn fast_atoi(b: &[u8]) -> i64 { let mut x = 0i64; for &c in b { x = x * 10 + (c - b'0') as i64; } x }
+pub fn parse_pos(b: &[u8]) -> Option<i64> {
+    if b.is_empty() || b.len() > 18 { return None; }
+    let mut x = 0i64;
+    for &c in b {
+        let d = c.wrapping_sub(b'0');
+        if d > 9 { return None; }
+        x = x * 10 + d as i64;
+    }
+    Some(x)
+}
 
 /// Per-thread cache of the last chrom name -> id lookup (pairs files are chrom-clustered).
 /// id -1 = empty cache; an empty name never hits (it can't be a valid cached lookup).
@@ -65,10 +77,13 @@ pub fn parse_line(line: &[u8], bins: &Bins, cache: &mut ChromCache) -> Result<Op
     }
     if nt < 4 { return Ok(None); }
     let c1 = &line[t[1] + 1..t[2]];
-    let p1 = fast_atoi(&line[t[2] + 1..t[3]]);
     let c2 = &line[t[3] + 1..t[4]];
     let p2rest = &line[t[4] + 1..];
-    let p2 = fast_atoi(match memchr(b'\t', p2rest) { Some(x) => &p2rest[..x], None => p2rest });
+    let pos = |f: &[u8]| parse_pos(f).ok_or_else(|| anyhow!(
+        "pairs line has a non-numeric position {:?}: {:?}",
+        String::from_utf8_lossy(f), String::from_utf8_lossy(line)));
+    let p1 = pos(&line[t[2] + 1..t[3]])?;
+    let p2 = pos(match memchr(b'\t', p2rest) { Some(x) => &p2rest[..x], None => p2rest })?;
     let lookup = |c: &[u8]| -> Result<i64> {
         bins.cmap.get(c).copied().ok_or_else(|| anyhow!(
             "pairs line references chromosome {:?} not present in the #chromsize header",
@@ -81,8 +96,8 @@ pub fn parse_line(line: &[u8], bins: &Bins, cache: &mut ChromCache) -> Result<Op
     let z = if bins.one_based { 1 } else { 0 };
     let b1 = bins.off_lo[i1 as usize] + (p1 - z).max(0) / bins.binsize;
     let b2 = bins.off_lo[i2 as usize] + (p2 - z).max(0) / bins.binsize;
-    // out-of-range positions (bad chromsizes, malformed/non-numeric fields) would silently land
-    // in the NEXT chromosome's bins — corrupt output, no symptom. Refuse the line instead.
+    // an out-of-range position (wrong chromsizes) would silently land in the NEXT chromosome's
+    // bins — corrupt output, no symptom. Refuse the line instead.
     if b1 >= bins.off_hi[i1 as usize] {
         bail!("pairs line has position {} beyond chromosome {:?}",
               p1, String::from_utf8_lossy(c1));
@@ -139,7 +154,14 @@ pub fn scan_spill_index(path: &str) -> Result<Vec<(i64, u64)>> {
     Ok(out)
 }
 
-fn worker(rx: Receiver<Vec<u8>>, bins: Arc<Bins>, cap: usize, tmpdir: Arc<String>, wid: usize)
+fn worker(rx: Receiver<Vec<u8>>, bins: Arc<Bins>, cap: usize, tmpdir: Arc<String>, wid: usize,
+          failed: Arc<AtomicBool>) -> Result<(Vec<String>, u64)> {
+    let r = worker_inner(rx, bins, cap, tmpdir, wid);
+    if r.is_err() { failed.store(true, Ordering::Relaxed); } // tells the producer to stop reading
+    r
+}
+
+fn worker_inner(rx: Receiver<Vec<u8>>, bins: Arc<Bins>, cap: usize, tmpdir: Arc<String>, wid: usize)
     -> Result<(Vec<String>, u64)> {
     let mut buf: Vec<i64> = Vec::with_capacity(cap);
     let mut paths = Vec::new();
@@ -167,9 +189,8 @@ fn worker(rx: Receiver<Vec<u8>>, bins: Arc<Bins>, cap: usize, tmpdir: Arc<String
             }
         }
     }
-    let mut buf = buf; let mut seq = seq; let mut paths2 = paths;
-    spill(&mut buf, &mut seq, &mut paths2)?;
-    Ok((paths2, np))
+    spill(&mut buf, &mut seq, &mut paths)?;
+    Ok((paths, np))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -191,6 +212,7 @@ pub fn cload(pairs: &str, binsize: i64, out: &str, mem_gb: f64, nthreads: usize,
     let mut names: Vec<String> = Vec::new();
     let mut lengths: Vec<i64> = Vec::new();
     let mut cmap: HashMap<Vec<u8>, i64> = HashMap::new();
+    let mut header_asm = String::new();
     let mut leftover: Vec<u8> = Vec::new();
     let mut chunk = vec![0u8; 1 << 24];
     let mut body_tail: Vec<u8> = Vec::new();
@@ -213,8 +235,11 @@ pub fn cload(pairs: &str, binsize: i64, out: &str, mem_gb: f64, nthreads: usize,
                     if parts.len() == 2 {
                         cmap.insert(parts[0].to_vec(), names.len() as i64);
                         names.push(String::from_utf8_lossy(parts[0]).into_owned());
-                        lengths.push(fast_atoi(parts[1]));
+                        lengths.push(parse_pos(parts[1]).ok_or_else(|| anyhow!(
+                            "bad #chromsize header line: {:?}", String::from_utf8_lossy(line)))?);
                     }
+                } else if let Some(rest) = line.strip_prefix(b"#genome_assembly:") {
+                    header_asm = String::from_utf8_lossy(rest).trim().to_string();
                 }
                 start += rel + 1;
             } else {
@@ -225,16 +250,18 @@ pub fn cload(pairs: &str, binsize: i64, out: &str, mem_gb: f64, nthreads: usize,
         leftover.drain(..start);
     }
     if binsize <= 0 { bail!("binsize must be positive, got {}", binsize); }
-    let mut off_lo = vec![0i64];
-    for &l in &lengths { off_lo.push(off_lo.last().unwrap() + (l + binsize - 1) / binsize); }
-    let nbins = *off_lo.last().unwrap();
+    if names.is_empty() {
+        // also what a failed decompressor looks like, so name the likely causes
+        bail!("{}: no `#chromsize:` header lines found (empty or unreadable input, or a .pairs \
+               file without the 4DN header)", pairs);
+    }
+    let off = crate::cooler::bin_offsets(&lengths, binsize);
+    let nbins = *off.last().unwrap();
     crate::cooler::check_key_space(nbins)?;
-    let off_hi = off_lo[1..].to_vec();
-    off_lo.pop();
-    // no mystery coolers: require a genome assembly (explicit or fingerprinted) or refuse
+    let (off_lo, off_hi) = (off[..off.len() - 1].to_vec(), off[1..].to_vec());
+    // no mystery coolers: --assembly, else the file's #genome_assembly, else a fingerprint
     let chromsizes: Vec<(String, i64)> = names.iter().cloned().zip(lengths.iter().cloned()).collect();
-    let asm = crate::view::resolve_assembly(assembly, &chromsizes).ok_or_else(|| anyhow!(
-        "refusing to create a cooler without a genome assembly: could not detect it from the chromsizes; pass --assembly <name>"))?;
+    let asm = crate::view::resolve_assembly(assembly, &header_asm, &chromsizes)?;
     if log { eprintln!("  genome-assembly: {}", asm); }
     let bins = Arc::new(Bins { cmap, off_lo, off_hi, nbins, binsize, one_based });
 
@@ -243,10 +270,11 @@ pub fn cload(pairs: &str, binsize: i64, out: &str, mem_gb: f64, nthreads: usize,
     let cap = (((mem_gb * 1e9 / 8.0) as usize) / nthreads).max(1 << 20);
     let (tx, rx) = bounded::<Vec<u8>>(nthreads * 4);
     let td = Arc::new(tmpdir.to_string());
+    let failed = Arc::new(AtomicBool::new(false));
     let mut handles = Vec::new();
     for wid in 0..nthreads {
-        let (rx, bins, td) = (rx.clone(), bins.clone(), td.clone());
-        handles.push(std::thread::spawn(move || worker(rx, bins, cap, td, wid)));
+        let (rx, bins, td, fl) = (rx.clone(), bins.clone(), td.clone(), failed.clone());
+        handles.push(std::thread::spawn(move || worker(rx, bins, cap, td, wid, fl)));
     }
     drop(rx);
 
@@ -254,6 +282,7 @@ pub fn cload(pairs: &str, binsize: i64, out: &str, mem_gb: f64, nthreads: usize,
     let mut tail = body_tail;
     if let Some(pos) = memrchr(b'\n', &tail) { let blk = tail[..pos + 1].to_vec(); tx.send(blk).ok(); tail.drain(..pos + 1); }
     loop {
+        if failed.load(Ordering::Relaxed) { break; } // a worker hit a bad line: stop feeding
         let n = rd.read(&mut chunk)?;
         if n == 0 { break; }
         tail.extend_from_slice(&chunk[..n]);
@@ -262,10 +291,18 @@ pub fn cload(pairs: &str, binsize: i64, out: &str, mem_gb: f64, nthreads: usize,
     if !tail.is_empty() { tail.push(b'\n'); tx.send(tail).ok(); }
     drop(tx);
     drop(rd);
-    if let Some(mut c) = child { c.wait()?; }
+    // a decompressor that died mid-stream (truncated or corrupt .gz) just looks like EOF on
+    // the pipe; its exit status is the only sign that the input was cut short
+    let mut phase1_err: Option<anyhow::Error> = None;
+    if let Some(mut c) = child {
+        let st = c.wait()?;
+        if !st.success() && !failed.load(Ordering::Relaxed) {
+            phase1_err = Some(anyhow!("bgzip failed on {} ({}): the input is truncated or corrupt; \
+                                       refusing to write a partial cooler", pairs, st));
+        }
+    }
 
     let mut run_paths = Vec::new(); let mut npairs = 0u64;
-    let mut phase1_err: Option<anyhow::Error> = None;
     for h in handles {
         match h.join() {
             Ok(Ok((p, np))) => { run_paths.extend(p); npairs += np; }
@@ -281,10 +318,8 @@ pub fn cload(pairs: &str, binsize: i64, out: &str, mem_gb: f64, nthreads: usize,
         npairs, run_paths.len(), t0.elapsed().as_secs_f64(), npairs as f64 / t0.elapsed().as_secs_f64() / 1e6); }
 
     // --- phase B: ranged-parallel k-way drain-and-count merge over the spilled runs ---
-    let mut off = vec![0i64];
-    for &l in &lengths { off.push(off.last().unwrap() + (l + binsize - 1) / binsize); }
     let mut guard = crate::cooler::PartialFileGuard::new(out);
-    let mut w = CoolWriter::create(out, &names, &lengths, binsize, nbins as usize, &off, comp, &asm)?;
+    let mut w = CoolWriter::create(out, &names, &lengths, binsize, comp, &asm)?;
     guard.arm();
     let nnz = match merge_runs_parallel(&run_paths, nbins, nthreads, mem_gb, &mut w, log) {
         Ok(n) => n,
@@ -298,9 +333,8 @@ pub fn cload(pairs: &str, binsize: i64, out: &str, mem_gb: f64, nthreads: usize,
     Ok(nnz)
 }
 
-/// Phase B: split the key space into P ranges (from the runs' per-block first_keys), merge each
-/// range on its own thread, and stream the range outputs to the single writer IN ORDER over
-/// bounded channels. Backpressure bounds RAM; no temp files, and HDF5 stays on one thread.
+/// Phase B: split the key space into P ranges (from the runs' per-block first_keys) and k-way
+/// merge each range on its own thread into the single writer, in order.
 fn merge_runs_parallel(
     run_paths: &[String], nbins: i64, nthreads: usize, mem_gb: f64, w: &mut CoolWriter, log: bool,
 ) -> Result<u64> {
@@ -309,11 +343,6 @@ fn merge_runs_parallel(
     let nruns = run_paths.len().max(1);
     let budget = ((mem_gb * 0.5 * 1e9) / (nruns as f64 * per_reader_bytes)) as usize;
     let p = nthreads.min(budget).max(1);
-    if p <= 1 {
-        if log { eprintln!("  phase2: serial merge ({} runs)", nruns); }
-        return merge_sources_to_writer(
-            run_paths.iter().map(|s| RunReader::open(s)).collect::<Result<Vec<_>>>()?, nbins, w);
-    }
     // one header-only scan per run gives both the range pivots and the per-run block index
     let indexes: Vec<Vec<(i64, u64)>> = run_paths.iter().map(|s| scan_spill_index(s)).collect::<Result<_>>()?;
     let mut firsts: Vec<i64> = indexes.iter().flat_map(|v| v.iter().map(|&(k, _)| k)).collect();
@@ -327,44 +356,12 @@ fn merge_runs_parallel(
     }
     bounds.push(i64::MAX);
     let nranges = bounds.len() - 1;
-    if log { eprintln!("  phase2: {} runs, {} ranges x {} threads", nruns, nranges, p); }
-
-    let paths = Arc::new(run_paths.to_vec());
-    let idx = Arc::new(indexes);
-    let nclamped = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let mut rxs = Vec::new();
-    let mut handles = Vec::new();
-    for r in 0..nranges {
-        let (lo, hi) = (bounds[r], bounds[r + 1]);
-        let (tx, rx) = bounded::<(Vec<i64>, Vec<i64>, Vec<i32>)>(2);
-        rxs.push(rx);
-        let (pa, ia, nc) = (paths.clone(), idx.clone(), nclamped.clone());
-        handles.push(std::thread::spawn(move || -> Result<u64> {
-            let srcs: Vec<RunReader> = pa.iter().enumerate()
-                .map(|(k, s)| RunReader::open_range(s, &ia[k], lo, hi))
-                .collect::<Result<_>>()?;
-            let mut local = 0u64;
-            let n = merge_sources(srcs, 1 << 22, |keys, cnts| {
-                let b1 = keys.iter().map(|&x| x / nbins).collect();
-                let b2 = keys.iter().map(|&x| x % nbins).collect();
-                let c = cnts.iter().map(|&x| crate::cooler::clamp_count(x, &mut local)).collect();
-                tx.send((b1, b2, c)).map_err(|_| anyhow!("phase-B channel closed")).map(|_| ())
-            });
-            nc.fetch_add(local, std::sync::atomic::Ordering::Relaxed);
-            n
-        }));
-    }
-    // writer drains ranges in order; later ranges keep merging concurrently behind their channels
-    let mut nnz = 0u64;
-    for rx in &rxs {
-        while let Ok((b1, b2, c)) = rx.recv() { w.append(&b1, &b2, &c)?; nnz += b1.len() as u64; }
-    }
-    // a worker error also closes its channel; join and check BEFORE the caller finalizes the file
-    for h in handles {
-        h.join().map_err(|_| anyhow!("phase-B merge thread panicked"))??;
-    }
-    crate::merge::warn_clamped(nclamped.load(std::sync::atomic::Ordering::Relaxed));
-    Ok(nnz)
+    if log { eprintln!("  phase2: {} runs, {} ranges", nruns, nranges); }
+    merge_ranges_to_writer(nranges, 1 << 22, nbins, w, |r| {
+        run_paths.iter().zip(&indexes)
+            .map(|(path, index)| RunReader::open_range(path, index, bounds[r], bounds[r + 1]))
+            .collect()
+    })
 }
 
 /// Reads i64 keys from a spilled run in blocks; yields (keys, counts=1).
@@ -457,8 +454,14 @@ mod tests {
         assert!(e.to_string().contains("beyond chromosome"), "unexpected error: {}", e);
         let e = parse_line(b"r2\tchr1\t150\tchr2\t99999\t+\t+", &b, &mut c).unwrap_err();
         assert!(e.to_string().contains("beyond chromosome"), "unexpected error: {}", e);
-        // a non-numeric position parses to garbage; the bin bound catches the structural damage
-        assert!(parse_line(b"r3\tchr1\tzzz\tchr1\t350\t+\t+", &b, &mut c).is_err());
+        // non-numeric positions are refused outright, including ones that would have parsed
+        // to an in-range number by accident (trailing junk, a sign, a stray CR)
+        for bad in [&b"r3\tchr1\tzzz\tchr1\t350\t+\t+"[..], b"r3\tchr1\t15x\tchr1\t350\t+\t+",
+                    b"r3\tchr1\t-5\tchr1\t350\t+\t+", b"r3\tchr1\t\tchr1\t350\t+\t+",
+                    b"r3\tchr1\t150\tchr1\t350\r"] {
+            let e = parse_line(bad, &b, &mut c).unwrap_err();
+            assert!(e.to_string().contains("non-numeric"), "unexpected error: {}", e);
+        }
         // last valid position of the last bin still parses
         assert_eq!(parse_line(b"r4\tchr2\t999\tchr2\t999\t+\t+", &b, &mut c).unwrap(), Some(19 * 20 + 19));
     }

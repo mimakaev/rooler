@@ -2,27 +2,16 @@
 //! Coarsening is streaming: map each fine bin -> coarse bin (respecting chrom boundaries), and
 //! because fine pixels are sorted by bin1 the coarse bin1 is non-decreasing, so we accumulate one
 //! coarse row at a time (sort its bin2 + sum) and emit. O(nnz), bounded memory, no external sort.
-use crate::cooler::{CoolWriter, Comp};
+use crate::cooler::{bin_offsets, CoolWriter, Comp, PartialFileGuard};
+use crate::parread::stream_pixels;
 use anyhow::{bail, Result};
 use hdf5::File;
 use std::time::Instant;
 
 fn offsets(lengths: &[i64], res: i64) -> (Vec<i64>, i64) {
-    let mut off = vec![0i64];
-    for &l in lengths { off.push(off.last().unwrap() + (l + res - 1) / res); }
+    let off = bin_offsets(lengths, res);
     let n = *off.last().unwrap();
     (off, n)
-}
-
-fn read_root_meta(path: &str) -> Result<(Vec<String>, Vec<i64>, i64, String)> {
-    let m = crate::cooler::read_meta(path, None)?;
-    Ok((m.names, m.lengths, m.binsize, m.assembly))
-}
-
-/// Stream all pixels of `grp/pixels` in blocks, calling `f(bin1, bin2, count)`.
-/// Chunk decompression runs on rayon threads for gzip columns (see parread.rs).
-fn stream_pixels(g: &hdf5::Group, block: usize, f: impl FnMut(&[i64], &[i64], &[i32]) -> Result<()>) -> Result<()> {
-    crate::parread::stream_pixels(g, block, f)
 }
 
 struct RowAgg {
@@ -138,8 +127,7 @@ mod tests {
         std::fs::create_dir_all(&d).unwrap();
         let p = d.join("t.cool");
         let names = vec!["chrA".to_string()];
-        let mut w = CoolWriter::create(p.to_str().unwrap(), &names, &[100], 10, 10, &[0, 10],
-            Comp::None, "test").unwrap();
+        let mut w = CoolWriter::create(p.to_str().unwrap(), &names, &[100], 10, Comp::None, "test").unwrap();
         let mut agg = RowAgg::new(1); // emit=1: every flushed row drains straight to the writer
         agg.push(0, 5, i64::from(i32::MAX), &mut w).unwrap();
         agg.push(0, 7, 3, &mut w).unwrap();
@@ -185,14 +173,13 @@ pub fn zoomify_and_balance(
 /// Build the mcool. Returns the resolutions written, coarsest-last.
 pub fn zoomify(src: &str, out: &str, resolutions: Option<Vec<i64>>, comp: Comp, assembly: Option<&str>, log: bool) -> Result<Vec<i64>> {
     let t0 = Instant::now();
-    let (names, lengths, base_res, src_asm) = read_root_meta(src)?;
-    let chromsizes: Vec<(String, i64)> = names.iter().cloned().zip(lengths.iter().cloned()).collect();
-    let asm = match assembly {
-        Some(a) if !a.trim().is_empty() => a.trim().to_string(),
-        _ if !src_asm.is_empty() && src_asm != "unknown" => src_asm.clone(),
-        _ => crate::view::detect("", &chromsizes).map(|s| s.to_string()).ok_or_else(|| anyhow::anyhow!(
-            "refusing to write an mcool without a genome assembly (source lacks one); pass --assembly <name>"))?,
-    };
+    let meta = crate::cooler::read_meta(src, "/")?;
+    let asm = crate::view::resolve_assembly(assembly, &meta.assembly, &meta.chromsizes())?;
+    let (names, lengths, base_res) = (meta.names, meta.lengths, meta.binsize);
+    // File::create truncates: writing the mcool over its own source would destroy the input
+    if let (Ok(a), Ok(b)) = (std::fs::canonicalize(src), std::fs::canonicalize(out)) {
+        if a == b { bail!("zoomify: output {} is the source cooler itself", out); }
+    }
     // resolution schedule: explicit, or double until very coarse. An explicit list is
     // validated hard: a resolution finer than the base cannot be built, and a non-multiple
     // would coarsen with a silently truncated factor — corrupt coordinates, no symptom.
@@ -221,11 +208,9 @@ pub fn zoomify(src: &str, out: &str, resolutions: Option<Vec<i64>>, comp: Comp, 
             v
         }
     };
-    let f = File::create(out)?;
-    f.new_attr::<hdf5::types::VarLenAscii>().create("format")?
-        .write_scalar(&hdf5::types::VarLenAscii::from_ascii("HDF5::MCOOL")?)?;
-    f.new_attr::<i64>().create("format-version")?.write_scalar(&2i64)?;
-    let _ = f.create_group("resolutions")?;
+    let mut guard = PartialFileGuard::new(out);
+    let f = crate::cooler::create_mcool(out)?;
+    guard.arm();
     let block = 1 << 22;
     let emit = 1 << 20;
 
@@ -236,20 +221,12 @@ pub fn zoomify(src: &str, out: &str, resolutions: Option<Vec<i64>>, comp: Comp, 
     let mut built: Vec<i64> = Vec::new();
     for &res in &reslist {
         if res == base_res {
-            let (base_off, base_n) = offsets(&lengths, base_res);
             let mut w = CoolWriter::create_in(&f, &format!("resolutions/{}", base_res), &names, &lengths,
-                base_res, base_n as usize, &base_off, comp, &asm)?;
+                base_res, comp, &asm)?;
             let srcf = File::open(src)?;
-            let sg = srcf.group("/")?;
-            let mut ob1 = Vec::new(); let mut ob2 = Vec::new(); let mut oc = Vec::new();
-            stream_pixels(&sg, block, |a, b, c| {
-                ob1.extend_from_slice(a); ob2.extend_from_slice(b); oc.extend_from_slice(c);
-                if ob1.len() >= emit { w.append(&ob1, &ob2, &oc)?; ob1.clear(); ob2.clear(); oc.clear(); }
-                Ok(())
-            })?;
-            if !ob1.is_empty() { w.append(&ob1, &ob2, &oc)?; }
+            stream_pixels(&srcf.group("/")?, block, |a, b, c| w.append(a, b, c))?;
             w.close()?;
-            if log { eprintln!("  [zoomify] {}bp copied ({} bins) {:.0}s", base_res, base_n, t0.elapsed().as_secs_f64()); }
+            if log { eprintln!("  [zoomify] {}bp copied {:.0}s", base_res, t0.elapsed().as_secs_f64()); }
         } else {
             let from = built.iter().copied().filter(|&b| res % b == 0).max();
             let srcf; // keeps the source file open when streaming from the base cooler
@@ -257,9 +234,9 @@ pub fn zoomify(src: &str, out: &str, resolutions: Option<Vec<i64>>, comp: Comp, 
                 Some(fr) => (fr, f.group(&format!("resolutions/{}", fr))?),
                 None => { srcf = File::open(src)?; (base_res, srcf.group("/")?) }
             };
-            let (map, coarse_off, coarse_n) = build_map(&lengths, fine_res, res);
+            let (map, _, coarse_n) = build_map(&lengths, fine_res, res);
             let mut w = CoolWriter::create_in(&f, &format!("resolutions/{}", res), &names, &lengths,
-                res, coarse_n as usize, &coarse_off, comp, &asm)?;
+                res, comp, &asm)?;
             let mut agg = RowAgg::new(emit);
             stream_pixels(&pg, block, |a, b, c| {
                 for i in 0..a.len() {
@@ -281,6 +258,7 @@ pub fn zoomify(src: &str, out: &str, resolutions: Option<Vec<i64>>, comp: Comp, 
         }
         built.push(res);
     }
+    guard.defuse();
     if log { eprintln!("  zoomify DONE: {} resolutions in {:.0}s", reslist.len(), t0.elapsed().as_secs_f64()); }
     Ok(reslist)
 }

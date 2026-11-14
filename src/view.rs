@@ -1,7 +1,6 @@
 //! Genome "view" (regions for expected): arms / whole-chroms / custom.
 //! Opinionated per-genome defaults, no external (bioframe) dependency. Centromere midpoints for
-//! arm genomes are baked in (approximate is fine for per-arm expected; regenerate from UCSC
-//! cytoBand via scripts/arms.py). Unknown genomes must pass an explicit --view or we refuse.
+//! arm genomes are baked in (approximate is fine for per-arm expected). Unknown genomes must pass an explicit --view or we refuse.
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ViewKind { Arms, Chroms }
@@ -33,12 +32,17 @@ const SACCER3_CEN: &[(&str, i64)] = &[
     ("chrXIII",268031),("chrXIV",628758),("chrXV",326584),("chrXVI",555957),
 ];
 
-/// Resolve the assembly name to stamp into a cooler. Explicit user value wins (any non-empty
-/// string is trusted as provenance); otherwise fingerprint the chromsizes. None => indeterminate,
-/// and callers must REFUSE to write (no mystery coolers).
-pub fn resolve_assembly(user: Option<&str>, chromsizes: &[(String, i64)]) -> Option<String> {
-    if let Some(u) = user { let u = u.trim(); if !u.is_empty() { return Some(u.to_string()); } }
-    detect("", chromsizes).map(|s| s.to_string())
+/// Resolve the assembly name to stamp into a cooler, or refuse (no mystery coolers).
+/// Precedence: explicit user value (any non-empty string is trusted as provenance) > the name
+/// the input already carries (`stored`; "" or cooler's default "unknown" count as absent) >
+/// a fingerprint of the chromsizes.
+pub fn resolve_assembly(user: Option<&str>, stored: &str, chromsizes: &[(String, i64)]) -> anyhow::Result<String> {
+    let named = |s: &str| { let s = s.trim(); (!s.is_empty() && s != "unknown").then(|| s.to_string()) };
+    user.and_then(named).or_else(|| named(stored))
+        .or_else(|| detect("", chromsizes).map(|s| s.to_string()))
+        .ok_or_else(|| anyhow::anyhow!(
+            "refusing to write a cooler without a genome assembly: the input names none and \
+             the chromsizes are not recognized; pass --assembly <name>"))
 }
 
 /// Normalize an assembly name and/or fingerprint chromsizes -> canonical genome id.

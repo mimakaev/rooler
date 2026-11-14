@@ -157,7 +157,8 @@ the `--mem` budget using typical cooler's consumption at a given --chunksize.
 ### Opinionated choices
 
 **No mystery coolers.** rooler refuses to write a cooler without a genome assembly. It will take
-`--assembly`, or infer one from the chromsizes.
+`--assembly`, the name the input already carries (a cooler's `genome-assembly`, a pairs file's
+`#genome_assembly:` header), or infer one from the chromsizes.
 
 **Expected comes built in.** In practice, people compute cis expected with cooltools at default
 parameters over chromosome arms — and wait minutes to hours for what is one O(nnz) pass. rooler
@@ -174,7 +175,15 @@ rooler writes ordinary cooler files: gzip-compressed with the same shuffle+defla
 cooler itself uses, so any HDF5 reader opens them with no filter plugins and no conversion.
 `cooler`, `cooltools` and `h5py` are tested against directly (see
 [docs/VALIDATION.md](docs/VALIDATION.md)); other consumers of the format should work but have
-not been tried. 
+not been tried.
+
+Every cooler carries the attribute set cooler's own writer produces — `nnz`, `sum`, `nbins`,
+`nchroms`, `bin-size`, `bin-type`, `storage-mode`, `genome-assembly`, `format`,
+`format-version`, `format-url`, `generated-by`, `creation-date`, `metadata` — so
+`Cooler.info[...]` works for any key, and `bins/weight` carries cooler's balancing attributes
+with the same types. Two of those differ in meaning: `tol` and `var` describe rooler's
+scale-free stopping rule (the marginals' coefficient of variation, squared for `var`), not
+cooler's absolute variance.
 
 `.pairs` coordinates are read as **1-based**, per the 4DN spec and cooler's default; pass
 `--zero-based` for a file that genuinely is not.

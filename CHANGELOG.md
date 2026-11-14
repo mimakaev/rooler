@@ -2,6 +2,66 @@
 
 ## Unreleased
 
+### Fixed — cooler attribute compatibility
+A rooler cooler was missing attributes every cooler-written file has, so code indexing
+`Cooler.info` could fail on rooler output (`cooltools.sample` reads `info["sum"]`, for one).
+Diffing rooler files attribute-by-attribute against `cooler` 0.10 output:
+- **`sum`** (total contacts) was never written. It is now, by every op that writes pixels
+  (`cload`, `merge`, `zoomify`, `repack`), along with **`creation-date`**, **`format-url`** and
+  **`metadata`**. `generated-by` now carries the version (`rooler-0.1.0-alpha.2`). The group
+  attributes are now the same set, with the same types, as cooler's own.
+- **Balance flags were strings.** `converged`, `cis_only` and `divisive_weights` on
+  `bins/weight` were stored as `"True"`/`"False"`; in Python `"False"` is truthy, so
+  `if weights.attrs["divisive_weights"]` took the wrong branch. They are real booleans now, as
+  cooler writes them.
+- String attributes are variable-length UTF-8 (h5py's native form) rather than ASCII.
+- Python: `Rooler.info` returned a hand-built five-key dict; it now returns the file's
+  attributes, equal to `cooler.Cooler(...).info`.
+
+Files written by earlier rooler builds stay readable; `rooler repack` brings them up to date
+(adds `sum`, converts the string flags to booleans).
+
+### Fixed — bugs found in review
+- **`cload` wrote a truncated cooler from a truncated `.pairs.gz` and exited 0.** The
+  decompressor's exit status was never checked, so a cut-short or corrupt input looked like a
+  normal end of stream. It is now an error and no output is left behind.
+- **`cload` accepted non-numeric positions.** `20x`, `-5`, an empty field or a stray `\r` were
+  parsed as garbage and binned wherever the garbage landed, unless it happened to fall past the
+  chromosome end. A position that is not all digits now fails the load, naming the line. A
+  failing worker also stops the reader instead of letting it decompress the rest of the input.
+- **`repack` truncated float attributes on carried weights.** Attribute types were probed by
+  "does it read as an integer?", and HDF5 converts floats to integers without complaint — so a
+  cooler-balanced file came out with `scale` 703.45 -> 703, `tol` 1e-5 -> 0, `var` -> 0, and its
+  boolean flags as integers. Integer `bins/` columns were likewise carried as floats. Both now
+  dispatch on the stored type. `repack` also keeps the source's `metadata`.
+- **`zoomify` onto its own source destroyed the source** (the output is created by truncation).
+  Refused now; a failed zoomify also no longer leaves a partial `.mcool` behind.
+- A cooler whose bin table is not the regular fixed-width layout for its `bin-size` is refused
+  rather than silently re-binned; `expected`/`balance` accept any `file::group` URI, not only
+  `resolutions/N`.
+- `cload` uses the pairs header's `#genome_assembly:` when `--assembly` is not given (it was
+  ignored, falling straight through to the chromsizes fingerprint).
+
+### Simplified
+- One merge driver instead of four: the "k-way merge each key range on its own thread, stream
+  to the writer in order" loop existed separately in `merge` (serial and parallel variants) and
+  in `cload`'s phase B (serial and parallel variants). All four are now
+  `merge::merge_ranges_to_writer`; one range is simply the single-threaded case.
+  `merge_coolers_parallel` + `merge_coolers` became one `merge_coolers(.., nthreads, ..)`.
+- `CoolWriter::create` no longer takes `nbins` and `chrom_offset`: they are implied by the
+  chromsizes and bin size, and four call sites each recomputed them. One `bin_offsets`.
+- Assembly resolution (`--assembly` > stored name > chromsizes fingerprint > refuse) was
+  copy-pasted in five places; it is `view::resolve_assembly`.
+- Cooler locations are a `(path, group)` pair everywhere (`cooler::split_uri`), replacing an
+  `Option<resolution>` in some ops and URI string-splitting in others.
+- Removed the internal `test-write` subcommand and several pass-through wrappers. Python:
+  dense fetch assigns pixels instead of `np.add.at` + a diagonal correction; `_Slicer` folded
+  into `_MatrixSelector`.
+
+Library API changes (the CLI is unchanged): `merge::merge_coolers` signature,
+`CoolWriter::create`/`create_in` signature, `read_meta(path, group)`,
+`view::resolve_assembly`.
+
 ### Fixed — silent mis-handling of other cooler flavours
 Testing rooler against coolers built by `cooler` with each of its schema options found three
 cases that were accepted and quietly corrupted rather than refused:
