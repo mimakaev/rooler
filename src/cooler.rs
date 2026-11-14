@@ -105,11 +105,75 @@ pub struct Meta {
     pub assembly: String,
 }
 
-fn open_res<'a>(f: &'a File, res: Option<&str>) -> Result<Group> {
-    match res {
-        Some(r) => Ok(f.group(&format!("resolutions/{}", r))?),
-        None => Ok(f.group("/")?),
+impl Meta {
+    pub fn chromsizes(&self) -> Vec<(String, i64)> {
+        self.names.iter().cloned().zip(self.lengths.iter().copied()).collect()
     }
+}
+
+/// "file.mcool::resolutions/1000" -> (path, group); a bare path means the root group "/".
+pub fn split_uri(uri: &str) -> (String, String) {
+    match uri.split_once("::") {
+        Some((p, g)) if !g.is_empty() => (p.to_string(), g.to_string()),
+        Some((p, _)) => (p.to_string(), "/".to_string()),
+        None => (uri.to_string(), "/".to_string()),
+    }
+}
+
+/// First bin of every chromosome, plus the total as the last element (cooler's chrom_offset).
+pub fn bin_offsets(lengths: &[i64], binsize: i64) -> Vec<i64> {
+    let mut off = vec![0i64];
+    for &l in lengths { off.push(off.last().unwrap() + (l + binsize - 1) / binsize); }
+    off
+}
+
+/// Read a scalar string attribute whatever its HDF5 flavour: cooler/h5py write variable-length
+/// UTF-8, older rooler files variable-length ASCII, other tools fixed-length. None = absent.
+pub fn read_str_attr(loc: &hdf5::Location, name: &str) -> Option<String> {
+    use hdf5::types::{VarLenAscii, VarLenUnicode};
+    let a = loc.attr(name).ok()?;
+    if let Ok(v) = a.read_scalar::<VarLenUnicode>() { return Some(v.as_str().to_string()); }
+    if let Ok(v) = a.read_scalar::<VarLenAscii>() { return Some(v.as_str().to_string()); }
+    if let Ok(v) = a.read_scalar::<FixedAscii<64>>() { return Some(v.as_str().to_string()); }
+    None
+}
+
+/// Write a scalar string attribute the way h5py does (variable-length UTF-8), replacing any
+/// existing one.
+pub fn write_str_attr(loc: &hdf5::Location, name: &str, val: &str) -> Result<()> {
+    let v: hdf5::types::VarLenUnicode = val.parse()
+        .map_err(|e| anyhow!("attribute {} = {:?} is not storable: {}", name, val, e))?;
+    if loc.attr(name).is_ok() {
+        // the crate has no attribute delete; a string of a different length cannot be
+        // overwritten in place, so drop the old attribute first
+        let cname = std::ffi::CString::new(name)?;
+        let rc = hdf5::sync::sync(|| unsafe { hdf5_metno_sys::h5a::H5Adelete(loc.id(), cname.as_ptr()) });
+        if rc < 0 { bail!("could not replace attribute {}", name); }
+    }
+    loc.new_attr::<hdf5::types::VarLenUnicode>().create(name)?.write_scalar(&v)?;
+    Ok(())
+}
+
+/// Create an empty .mcool container: root attributes + the `resolutions` group.
+pub fn create_mcool(path: &str) -> Result<File> {
+    let f = File::create(path)?;
+    write_str_attr(&f, "format", "HDF5::MCOOL")?;
+    f.new_attr::<i64>().create("format-version")?.write_scalar(&2i64)?;
+    f.create_group("resolutions")?;
+    Ok(f)
+}
+
+/// `datetime.isoformat()`-style UTC timestamp for a unix time (days -> civil date, no deps).
+fn iso_utc(unix_secs: u64) -> String {
+    let (days, rem) = ((unix_secs / 86_400) as i64, unix_secs % 86_400);
+    let z = days + 719_468;
+    let (era, doe) = (z.div_euclid(146_097), z.rem_euclid(146_097));
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let (d, m) = (doy - (153 * mp + 2) / 5 + 1, if mp < 10 { mp + 3 } else { mp - 9 });
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}+00:00", y, m, d, rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
 /// Refuse cooler variants rooler would otherwise mis-handle silently.
@@ -119,15 +183,7 @@ fn open_res<'a>(f: &'a File, res: Option<&str>) -> Result<Group> {
 /// below-diagonal pixels get double-counted by the symmetric kernels and relabelled
 /// "symmetric-upper" on write, and float counts get truncated to int32. So check up front.
 pub fn check_supported(g: &Group) -> Result<()> {
-    // cooler writes these as variable-length UTF-8, rooler as ASCII; accept either, and a
-    // fixed-length string too. Failing to read the attribute must not look like "absent".
-    let sattr = |n: &str| -> Option<String> {
-        let a = g.attr(n).ok()?;
-        if let Ok(v) = a.read_scalar::<hdf5::types::VarLenUnicode>() { return Some(v.as_str().to_string()); }
-        if let Ok(v) = a.read_scalar::<hdf5::types::VarLenAscii>() { return Some(v.as_str().to_string()); }
-        if let Ok(v) = a.read_scalar::<hdf5::types::FixedAscii<64>>() { return Some(v.as_str().to_string()); }
-        None
-    };
+    let sattr = |n: &str| read_str_attr(g, n);
     match sattr("storage-mode").as_deref() {
         None | Some("symmetric-upper") => {}
         Some(m) => bail!("storage-mode {:?} is not supported (rooler assumes symmetric-upper, \
@@ -148,20 +204,25 @@ pub fn check_supported(g: &Group) -> Result<()> {
     Ok(())
 }
 
-pub fn read_meta(path: &str, res: Option<&str>) -> Result<Meta> {
+/// Read the layout of the cooler in group `grp` ("/" or e.g. "resolutions/1000") of `path`.
+pub fn read_meta(path: &str, grp: &str) -> Result<Meta> {
     let f = File::open(path)?;
-    let g = open_res(&f, res)?;
+    let g = f.group(grp)?;
     check_supported(&g)?;
-    let raw = g.dataset("chroms/name")?.read_1d::<FixedAscii<64>>()
-        .or_else(|_| g.dataset("chroms/name")?.read_1d::<FixedAscii<8>>().map(|a| a.mapv(|x| FixedAscii::<64>::from_ascii(x.as_bytes()).unwrap())))?;
-    let names: Vec<String> = raw.iter().map(|s| s.to_string()).collect();
-    let lengths: Vec<i64> = g.dataset("chroms/length")?.read_1d::<i32>()?.iter().map(|&x| x as i64).collect();
+    let names: Vec<String> = g.dataset("chroms/name")?.read_1d::<FixedAscii<64>>()
+        .map_err(|e| anyhow!("{}: cannot read chroms/name (names over 64 bytes are not supported): {}", path, e))?
+        .iter().map(|s| s.to_string()).collect();
+    let lengths: Vec<i64> = g.dataset("chroms/length")?.read_1d::<i64>()?.to_vec();
     let chrom_offset: Vec<i64> = g.dataset("indexes/chrom_offset")?.read_1d::<i64>()?.to_vec();
     let nbins = g.dataset("bins/start")?.shape()[0];
-    let binsize = g.attr("bin-size").or_else(|_| f.attr("bin-size"))?.read_scalar::<i64>()?;
-    let assembly = g.attr("genome-assembly").or_else(|_| f.attr("genome-assembly")).ok()
-        .and_then(|a| a.read_scalar::<hdf5::types::VarLenAscii>().ok())
-        .map(|s| s.as_str().to_string()).unwrap_or_default();
+    let binsize = g.attr("bin-size")?.read_scalar::<i64>()?;
+    if binsize <= 0 { bail!("{}: bin-size {} is not positive", path, binsize); }
+    // every op rebuilds the bin table from (chromsizes, binsize); a file whose table is laid
+    // out differently would be silently re-binned, so it is refused here
+    if chrom_offset != bin_offsets(&lengths, binsize) || nbins as i64 != *chrom_offset.last().unwrap_or(&0) {
+        bail!("{}::{}: bin table is not the regular fixed-width layout for bin-size {}", path, grp, binsize);
+    }
+    let assembly = read_str_attr(&g, "genome-assembly").unwrap_or_default();
     Ok(Meta { names, lengths, chrom_offset, nbins, binsize, assembly })
 }
 
@@ -177,9 +238,9 @@ pub struct CoolerPix {
     _f: File,
 }
 impl CoolerPix {
-    pub fn open(path: &str, res: Option<&str>, nbins: usize, block: usize) -> Result<CoolerPix> {
+    pub fn open(path: &str, grp: &str, nbins: usize, block: usize) -> Result<CoolerPix> {
         let f = File::open(path)?;
-        let g = open_res(&f, res)?;
+        let g = f.group(grp)?;
         let cn = g.dataset("pixels/count")?;
         let end = cn.shape()[0];
         Ok(CoolerPix {
@@ -188,13 +249,13 @@ impl CoolerPix {
         })
     }
     /// reader confined to pixel range [p0, p1) — for a bin1-range partition (ranged-parallel merge).
-    pub fn open_slice(path: &str, res: Option<&str>, nbins: usize, block: usize, p0: usize, p1: usize) -> Result<CoolerPix> {
-        let mut c = Self::open(path, res, nbins, block)?;
+    pub fn open_slice(path: &str, grp: &str, nbins: usize, block: usize, p0: usize, p1: usize) -> Result<CoolerPix> {
+        let mut c = Self::open(path, grp, nbins, block)?;
         c.pos = p0; c.end = p1; Ok(c)
     }
     /// bin1_offset index for this cooler (for slicing bin1 ranges into pixel ranges).
-    pub fn bin1_offset(path: &str, res: Option<&str>) -> Result<Vec<i64>> {
-        let f = File::open(path)?; let g = open_res(&f, res)?;
+    pub fn bin1_offset(path: &str, grp: &str) -> Result<Vec<i64>> {
+        let f = File::open(path)?; let g = f.group(grp)?;
         let mut v = g.dataset("indexes/bin1_offset")?.read_1d::<i64>()?.to_vec();
         let nbins = g.dataset("bins/start")?.shape()[0];
         if v.len() == nbins { v.push(g.dataset("pixels/count")?.shape()[0] as i64); }
@@ -232,23 +293,25 @@ pub struct CoolWriter {
     chrom_offset: Vec<i64>,
     bincount: Vec<i64>,
     pub nnz: usize,
+    sum: i64,
     last_bin1: i64,
 }
 
 impl CoolWriter {
     pub fn create(
-        path: &str, names: &[String], lengths: &[i64], binsize: i64,
-        nbins: usize, chrom_offset: &[i64], comp: Comp, assembly: &str,
+        path: &str, names: &[String], lengths: &[i64], binsize: i64, comp: Comp, assembly: &str,
     ) -> Result<CoolWriter> {
         let f = File::create(path)?;
-        Self::create_in(&f, "/", names, lengths, binsize, nbins, chrom_offset, comp, assembly)
+        Self::create_in(&f, "/", names, lengths, binsize, comp, assembly)
     }
 
     /// Write a cooler into `group` ("/" for flat .cool, "resolutions/{res}" for an mcool level).
+    /// The bin table is the regular fixed-width one implied by (lengths, binsize).
     pub fn create_in(
         file: &File, group: &str, names: &[String], lengths: &[i64], binsize: i64,
-        nbins: usize, chrom_offset: &[i64], comp: Comp, assembly: &str,
+        comp: Comp, assembly: &str,
     ) -> Result<CoolWriter> {
+        if binsize <= 0 { bail!("binsize must be positive, got {}", binsize); }
         // chrom lengths and bin coordinates are stored int32 (cooler schema); refuse loudly
         // instead of silently wrapping to negative coordinates (lungfish-class chromosomes)
         for (n, &l) in names.iter().zip(lengths) {
@@ -258,26 +321,36 @@ impl CoolWriter {
             }
             if l < 0 { bail!("chromosome {:?} has negative length {}", n, l); }
         }
+        let chrom_offset = bin_offsets(lengths, binsize);
+        let nbins = *chrom_offset.last().unwrap() as usize;
         let g = if group == "/" { file.group("/")? } else { file.create_group(group)? };
-        let sattr = |name: &str, val: &str| -> Result<()> {
-            g.new_attr::<hdf5::types::VarLenAscii>().create(name)?
-                .write_scalar(&hdf5::types::VarLenAscii::from_ascii(val)?)?; Ok(())
+        // the full attribute set cooler's own writer produces (cooler.create.write_info), so
+        // `Cooler.info` has every key downstream code may index — `sum` and `nnz` included;
+        // those two are placeholders here and get their real values in close()
+        let sattr = |name: &str, val: &str| write_str_attr(&g, name, val);
+        let iattr = |name: &str, val: i64| -> Result<()> {
+            g.new_attr::<i64>().create(name)?.write_scalar(&val)?; Ok(())
         };
         sattr("format", "HDF5::Cooler")?;
-        g.new_attr::<i64>().create("format-version")?.write_scalar(&3i64)?;
+        iattr("format-version", 3)?;
+        sattr("format-url", "https://github.com/open2c/cooler")?;
         sattr("bin-type", "fixed")?;
-        g.new_attr::<i64>().create("bin-size")?.write_scalar(&binsize)?;
+        iattr("bin-size", binsize)?;
         sattr("storage-mode", "symmetric-upper")?;
-        g.new_attr::<i64>().create("nbins")?.write_scalar(&(nbins as i64))?;
-        g.new_attr::<i64>().create("nchroms")?.write_scalar(&(names.len() as i64))?;
-        g.new_attr::<i64>().create("nnz")?.write_scalar(&0i64)?;
+        iattr("nbins", nbins as i64)?;
+        iattr("nchroms", names.len() as i64)?;
+        iattr("nnz", 0)?;
+        iattr("sum", 0)?;
         sattr("genome-assembly", assembly)?;
-        sattr("generated-by", "rooler")?;
+        sattr("generated-by", concat!("rooler-", env!("CARGO_PKG_VERSION")))?;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs()).unwrap_or(0);
+        sattr("creation-date", &iso_utc(now))?;
+        sattr("metadata", "{}")?;
 
         // chroms
         let gc = g.create_group("chroms")?;
-        let maxlen = names.iter().map(|n| n.len()).max().unwrap_or(1);
-        write_fixed_ascii(&gc, "name", names, maxlen)?;
+        write_fixed_ascii(&gc, "name", names)?;
         gc.new_dataset::<i32>().shape([names.len()]).create("length")?
             .write(&Array1::from(lengths.iter().map(|&l| l as i32).collect::<Vec<_>>()))?;
 
@@ -325,8 +398,8 @@ impl CoolWriter {
         };
 
         Ok(CoolWriter {
-            _f: file.clone(), g, pix, nbins, chrom_offset: chrom_offset.to_vec(),
-            bincount: vec![0i64; nbins], nnz: 0, last_bin1: -1,
+            _f: file.clone(), g, pix, nbins, chrom_offset,
+            bincount: vec![0i64; nbins], nnz: 0, sum: 0, last_bin1: -1,
         })
     }
 
@@ -350,6 +423,7 @@ impl CoolWriter {
             }
         }
         for &b in bin1 { self.bincount[b as usize] += 1; }
+        self.sum += count.iter().map(|&c| c as i64).sum::<i64>();
         self.nnz = hi;
         Ok(())
     }
@@ -369,6 +443,7 @@ impl CoolWriter {
         gi.new_dataset::<i64>().shape([self.chrom_offset.len()]).create("chrom_offset")?
             .write(&arr1(&self.chrom_offset))?;
         self.g.attr("nnz")?.write_scalar(&(self.nnz as i64))?;
+        self.g.attr("sum")?.write_scalar(&self.sum)?;
         // file flushes/closes when the last handle (driver's) drops; don't close here.
         Ok(())
     }
@@ -388,8 +463,7 @@ mod tests {
         // a normal rooler cooler passes
         let p = d.join("ok.cool");
         {
-            let mut w = CoolWriter::create(p.to_str().unwrap(), &names, &[100], 10, 10, &[0, 10],
-                Comp::None, "test").unwrap();
+            let mut w = CoolWriter::create(p.to_str().unwrap(), &names, &[100], 10, Comp::None, "test").unwrap();
             w.append(&[0], &[1], &[3]).unwrap();
             w.close().unwrap();
         }
@@ -401,12 +475,25 @@ mod tests {
         {
             let f = File::append(p.to_str().unwrap()).unwrap();
             let g = f.group("/").unwrap();
-            g.attr("storage-mode").unwrap().write_scalar(
-                &hdf5::types::VarLenAscii::from_ascii("square").unwrap()).unwrap();
+            write_str_attr(&g, "storage-mode", "square").unwrap();
             let e = check_supported(&g).unwrap_err().to_string();
             assert!(e.contains("square") && e.contains("symmetric-upper"), "{}", e);
         }
         std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn iso_utc_formats_known_instants() {
+        assert_eq!(iso_utc(0), "1970-01-01T00:00:00+00:00");
+        assert_eq!(iso_utc(1_700_000_000), "2023-11-14T22:13:20+00:00");
+        assert_eq!(iso_utc(951_782_400), "2000-02-29T00:00:00+00:00"); // leap day
+    }
+
+    #[test]
+    fn split_uri_defaults_to_root() {
+        assert_eq!(split_uri("a.cool"), ("a.cool".into(), "/".into()));
+        assert_eq!(split_uri("a.mcool::resolutions/100"), ("a.mcool".into(), "resolutions/100".into()));
+        assert_eq!(split_uri("a.mcool::/resolutions/100"), ("a.mcool".into(), "/resolutions/100".into()));
     }
 
     #[test]
@@ -443,11 +530,11 @@ mod tests {
         let err_of = |r: Result<CoolWriter>| match r { Err(e) => e, Ok(_) => panic!("expected an error") };
         // > 2^31-1 bp cannot be stored in the schema's int32 coordinates -> refuse, don't wrap
         let e = err_of(CoolWriter::create(ps, &["chrBig".to_string()], &[3_000_000_000], 1_000_000,
-            3_000, &[0, 3_000], Comp::None, "t"));
+            Comp::None, "t"));
         assert!(e.to_string().contains("int32"), "unexpected error: {}", e);
         // names longer than 64 bytes are refused with the name in the message, not panicked on
         let long = "x".repeat(65);
-        let e = err_of(CoolWriter::create(ps, &[long], &[100], 10, 10, &[0, 10], Comp::None, "t"));
+        let e = err_of(CoolWriter::create(ps, &[long], &[100], 10, Comp::None, "t"));
         assert!(e.to_string().contains("64"), "unexpected error: {}", e);
         std::fs::remove_dir_all(&d).ok();
     }
@@ -457,8 +544,7 @@ mod tests {
         let d = tmpdir("append");
         let p = d.join("t.cool");
         let names = vec!["chrA".to_string()];
-        let mut w = CoolWriter::create(p.to_str().unwrap(), &names, &[100], 10, 10, &[0, 10],
-            Comp::None, "test").unwrap();
+        let mut w = CoolWriter::create(p.to_str().unwrap(), &names, &[100], 10, Comp::None, "test").unwrap();
         w.append(&[0, 1, 5], &[0, 3, 5], &[1, 1, 1]).unwrap();
         // going backwards in bin1 would silently corrupt the bin1_offset index
         let e = w.append(&[4], &[9], &[1]).unwrap_err();
@@ -477,8 +563,7 @@ mod tests {
         // chrA: 4 bins (35bp @10), chrB: 2 bins (20bp @10)
         let (b1, b2, c) = (vec![0i64, 0, 1, 4], vec![0i64, 3, 1, 5], vec![5i32, 2, 7, 3]);
         {
-            let mut w = CoolWriter::create(p.to_str().unwrap(), &names, &[35, 20], 10, 6, &[0, 4, 6],
-                Comp::Gzip(1), "test").unwrap();
+            let mut w = CoolWriter::create(p.to_str().unwrap(), &names, &[35, 20], 10, Comp::Gzip(1), "test").unwrap();
             w.append(&b1[..3], &b2[..3], &c[..3]).unwrap();
             w.append(&b1[3..], &b2[3..], &c[3..]).unwrap();
             assert_eq!(w.nnz, 4);
@@ -507,7 +592,20 @@ mod tests {
             }
             other => panic!("bins/chrom is not an enum: {:?}", other),
         }
+        // the attribute set cooler's own writer produces: Cooler.info must have every key
         assert_eq!(g.attr("nnz").unwrap().read_scalar::<i64>().unwrap(), 4);
+        assert_eq!(g.attr("sum").unwrap().read_scalar::<i64>().unwrap(), 17);
+        assert_eq!(g.attr("nbins").unwrap().read_scalar::<i64>().unwrap(), 6);
+        assert_eq!(g.attr("nchroms").unwrap().read_scalar::<i64>().unwrap(), 2);
+        assert_eq!(g.attr("bin-size").unwrap().read_scalar::<i64>().unwrap(), 10);
+        assert_eq!(g.attr("format-version").unwrap().read_scalar::<i64>().unwrap(), 3);
+        for (k, want) in [("format", "HDF5::Cooler"), ("bin-type", "fixed"), ("metadata", "{}"),
+                          ("storage-mode", "symmetric-upper"), ("genome-assembly", "test"),
+                          ("format-url", "https://github.com/open2c/cooler")] {
+            assert_eq!(read_str_attr(&g, k).as_deref(), Some(want), "attribute {}", k);
+        }
+        assert!(read_str_attr(&g, "generated-by").unwrap().starts_with("rooler-"));
+        assert!(read_str_attr(&g, "creation-date").unwrap().starts_with("20"));
         drop(f);
         std::fs::remove_dir_all(&d).ok();
     }
@@ -575,15 +673,17 @@ fn write_chrom_codes(g: &Group, cids: &[i32], names: &[String], comp: Comp) -> R
     })
 }
 
-fn write_fixed_ascii(g: &Group, name: &str, vals: &[String], maxlen: usize) -> Result<()> {
+/// Fixed-length ASCII string column (chromosome and region names), sized to the longest value.
+pub(crate) fn write_fixed_ascii(g: &Group, name: &str, vals: &[String]) -> Result<()> {
+    let long = vals.iter().max_by_key(|s| s.len()).map(|s| s.as_str()).unwrap_or("");
+    let maxlen = long.len();
     if maxlen > 64 {
-        let long = vals.iter().max_by_key(|s| s.len()).map(|s| s.as_str()).unwrap_or("");
-        bail!("chromosome name {:?} is {} bytes; at most 64 supported", long, long.len());
+        bail!("name {:?} is {} bytes; at most 64 supported", long, long.len());
     }
     macro_rules! w { ($n:expr) => {{
         let a: Vec<FixedAscii<$n>> = vals.iter()
             .map(|s| FixedAscii::<$n>::from_ascii(s.as_bytes())
-                .map_err(|e| anyhow!("chromosome name {:?} is not ASCII: {}", s, e)))
+                .map_err(|e| anyhow!("name {:?} is not ASCII: {}", s, e)))
             .collect::<Result<_>>()?;
         g.new_dataset::<FixedAscii<$n>>().shape([vals.len()]).create(name)?.write(&arr1(&a))?;
     }}}

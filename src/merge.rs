@@ -2,7 +2,7 @@
 //! Heap-based (O(N log K)); draining all equal keys (across streams and within a stream)
 //! yields an aggregated sorted (key,count) stream. Bounded RAM = K * block + emit buffer.
 use crate::cooler::{clamp_count, CoolWriter, CoolerPix, Comp, read_meta};
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -87,34 +87,11 @@ pub fn merge_sources<S: BlockSource>(
     Ok(nout)
 }
 
-/// Merge sorted key/count sources directly into a cooler writer (bin1,bin2,count).
-pub fn merge_sources_to_writer<S: BlockSource>(
-    srcs: Vec<S>, nbins: i64, w: &mut CoolWriter,
-) -> Result<u64> {
-    let emit_block = 1 << 22;
-    let mut nclamped = 0u64;
-    let n = merge_sources(srcs, emit_block, |keys, cnts| {
-        let b1: Vec<i64> = keys.iter().map(|&x| x / nbins).collect();
-        let b2: Vec<i64> = keys.iter().map(|&x| x % nbins).collect();
-        let c: Vec<i32> = cnts.iter().map(|&x| clamp_count(x, &mut nclamped)).collect();
-        w.append(&b1, &b2, &c)
-    })?;
-    warn_clamped(nclamped);
-    Ok(n)
-}
-
-/// One-line warning when counts saturated at i32::MAX (storage dtype is i32 by design).
-pub(crate) fn warn_clamped(n: u64) {
-    if n > 0 {
-        eprintln!("  WARNING: {} pixels clamped at i32::MAX (counts are stored as i32)", n);
-    }
-}
-
 /// All inputs must share the same bin layout, else the merged pixel table is meaningless.
 /// `meta` is the reference (read from paths[0]).
-fn check_inputs_match(meta: &crate::cooler::Meta, paths: &[String], res: Option<&str>) -> Result<()> {
+fn check_inputs_match(meta: &crate::cooler::Meta, paths: &[String], grp: &str) -> Result<()> {
     for p in &paths[1..] {
-        let m = read_meta(p, res)?;
+        let m = read_meta(p, grp)?;
         if m.binsize != meta.binsize {
             anyhow::bail!("merge: {} has binsize {} but {} has {}", p, m.binsize, paths[0], meta.binsize);
         }
@@ -237,131 +214,93 @@ mod tests {
     }
 }
 
-/// Ranged-parallel merge: partition bin1 into P count-balanced ranges (sliced from each input via
-/// bin1_offset), merge each range on its own thread, and stream range outputs to the writer IN ORDER
-/// via bounded channels (backpressure bounds RAM; no temp files). Falls back to serial for P<=1.
-pub fn merge_coolers_parallel(
-    paths: &[String], res: Option<&str>, out: &str, mem_gb: f64, nthreads: usize, comp: Comp,
+/// Merge `nranges` disjoint, ascending slices of key space, each on its own thread, and stream
+/// their outputs into the single writer IN ORDER over bounded channels: backpressure bounds RAM,
+/// there are no temp files, and all HDF5 writes stay on the calling thread. `open(r)` builds the
+/// sources for range r (called on that range's thread). Shared by merge and cload's phase B.
+pub(crate) fn merge_ranges_to_writer<S: BlockSource>(
+    nranges: usize, emit_block: usize, nbins: i64, w: &mut CoolWriter,
+    open: impl Fn(usize) -> Result<Vec<S>> + Sync,
+) -> Result<u64> {
+    let nclamped = AtomicU64::new(0);
+    let nnz = std::thread::scope(|s| -> Result<u64> {
+        let mut rxs = Vec::new();
+        let mut handles = Vec::new();
+        for r in 0..nranges {
+            let (tx, rx) = crossbeam_channel::bounded::<(Vec<i64>, Vec<i64>, Vec<i32>)>(2);
+            rxs.push(rx);
+            let (open, nclamped) = (&open, &nclamped);
+            handles.push(s.spawn(move || -> Result<()> {
+                let mut local = 0u64;
+                let res = merge_sources(open(r)?, emit_block, |keys, cnts| {
+                    let b1 = keys.iter().map(|&x| x / nbins).collect();
+                    let b2 = keys.iter().map(|&x| x % nbins).collect();
+                    let c = cnts.iter().map(|&x| clamp_count(x, &mut local)).collect();
+                    tx.send((b1, b2, c)).map_err(|_| anyhow!("merge output channel closed"))
+                });
+                nclamped.fetch_add(local, Ordering::Relaxed);
+                res.map(|_| ())
+            }));
+        }
+        // drain ranges in order; later ranges keep merging behind their channels meanwhile.
+        // (An early return drops the remaining receivers, which unblocks and ends the workers.)
+        let mut nnz = 0u64;
+        for rx in rxs {
+            for (b1, b2, c) in rx { w.append(&b1, &b2, &c)?; nnz += b1.len() as u64; }
+        }
+        // a failed worker also just closes its channel, so the drain above cannot tell a
+        // finished range from a failed one — check every worker BEFORE the caller finalizes
+        for h in handles {
+            h.join().map_err(|_| anyhow!("merge worker thread panicked"))??;
+        }
+        Ok(nnz)
+    })?;
+    let n = nclamped.load(Ordering::Relaxed);
+    if n > 0 { eprintln!("  WARNING: {} pixels clamped at i32::MAX (counts are stored as i32)", n); }
+    Ok(nnz)
+}
+
+/// Merge coolers (group `grp` of each path) by summing matching pixels. The bin1 axis is cut
+/// into up to `nthreads` count-balanced ranges, sliced out of every input via its bin1_offset
+/// index, and each range is k-way merged on its own thread.
+#[allow(clippy::too_many_arguments)]
+pub fn merge_coolers(
+    paths: &[String], grp: &str, out: &str, mem_gb: f64, nthreads: usize, comp: Comp,
     assembly: Option<&str>, log: bool,
 ) -> Result<u64> {
-    use std::sync::Arc;
-    if nthreads <= 1 { return merge_coolers(paths, res, out, mem_gb, comp, assembly, log); }
     let t0 = std::time::Instant::now();
-    let meta = read_meta(&paths[0], res)?;
-    check_inputs_match(&meta, paths, res)?;
+    let meta = read_meta(&paths[0], grp)?;
+    check_inputs_match(&meta, paths, grp)?;
     let nbins = meta.nbins as i64;
     crate::cooler::check_key_space(nbins)?;
-    let chromsizes: Vec<(String, i64)> = meta.names.iter().cloned().zip(meta.lengths.iter().cloned()).collect();
-    let asm = match assembly {
-        Some(a) if !a.trim().is_empty() => a.trim().to_string(),
-        _ if !meta.assembly.is_empty() && meta.assembly != "unknown" => meta.assembly.clone(),
-        _ => crate::view::detect("", &chromsizes).map(|s| s.to_string()).ok_or_else(|| anyhow::anyhow!(
-            "refusing to merge without a genome assembly; pass --assembly"))?,
-    };
-    let offs: Vec<Vec<i64>> = paths.iter().map(|p| CoolerPix::bin1_offset(p, res)).collect::<Result<_>>()?;
-    // count-balanced bin1 partition into P ranges
+    let asm = crate::view::resolve_assembly(assembly, &meta.assembly, &meta.chromsizes())?;
+    let offs: Vec<Vec<i64>> = paths.iter().map(|p| CoolerPix::bin1_offset(p, grp)).collect::<Result<_>>()?;
+    // count-balanced bin1 partition
     let mut per = vec![0i64; meta.nbins];
     for o in &offs { for b in 0..meta.nbins { per[b] += o[b + 1] - o[b]; } }
-    let total: i64 = per.iter().sum();
-    let p = nthreads;
-    let target = (total / p as i64).max(1);
+    let p = nthreads.max(1);
+    let target = (per.iter().sum::<i64>() / p as i64).max(1);
     let mut bounds = vec![0usize]; let mut acc = 0i64;
     for b in 0..meta.nbins { acc += per[b]; if acc >= target && bounds.len() < p { bounds.push(b + 1); acc = 0; } }
     bounds.push(meta.nbins);
     let nranges = bounds.len() - 1;
     // each range holds one decoded block per input cursor (~24 B/pixel incl. read transients),
-    // so resident memory scales with ranges x inputs x block — k must be in the denominator
-    let k = paths.len().max(1);
-    let block = ((mem_gb * 0.3 * 1e9 / (24.0 * nranges as f64 * k as f64)) as usize)
-        .min(4_000_000).max(1 << 16);
-    if log { eprintln!("  merge(parallel): {} inputs, {} ranges, block={} pix, assembly={}", paths.len(), nranges, block, asm); }
+    // so resident memory scales with ranges x inputs x block
+    let block = ((mem_gb * 0.3 * 1e9 / (24.0 * nranges as f64 * paths.len() as f64)) as usize)
+        .clamp(1 << 16, 4_000_000);
+    if log { eprintln!("  merge: {} inputs, {} ranges, block={} pix, assembly={}", paths.len(), nranges, block, asm); }
 
-    let paths_a = Arc::new(paths.to_vec());
-    let offs_a = Arc::new(offs);
-    let res_a: Option<String> = res.map(|s| s.to_string());
-    let nclamped = Arc::new(AtomicU64::new(0));
-    let mut rxs = Vec::new();
-    let mut handles = Vec::new();
-    for r in 0..nranges {
+    let mut guard = crate::cooler::PartialFileGuard::new(out);
+    let mut w = CoolWriter::create(out, &meta.names, &meta.lengths, meta.binsize, comp, &asm)?;
+    guard.arm();
+    let nnz = merge_ranges_to_writer(nranges, block, nbins, &mut w, |r| {
         let (lo, hi) = (bounds[r], bounds[r + 1]);
-        let (tx, rx) = crossbeam_channel::bounded::<(Vec<i64>, Vec<i64>, Vec<i32>)>(2);
-        rxs.push(rx);
-        let (pa, oa, ra) = (paths_a.clone(), offs_a.clone(), res_a.clone());
-        let nc = nclamped.clone();
-        let nb = meta.nbins;
-        handles.push(std::thread::spawn(move || -> Result<u64> {
-            let srcs: Vec<CoolerPix> = pa.iter().enumerate().map(|(k, pth)| {
-                let (p0, p1) = (oa[k][lo] as usize, oa[k][hi] as usize);
-                CoolerPix::open_slice(pth, ra.as_deref(), nb, block, p0, p1)
-            }).collect::<Result<_>>()?;
-            let mut local = 0u64;
-            let n = merge_sources(srcs, block, |keys, cnts| {
-                let b1 = keys.iter().map(|&x| x / nbins).collect();
-                let b2 = keys.iter().map(|&x| x % nbins).collect();
-                let c = cnts.iter().map(|&x| clamp_count(x, &mut local)).collect();
-                tx.send((b1, b2, c)).map_err(|_| anyhow::anyhow!("merge channel closed")).map(|_| ())
-            });
-            nc.fetch_add(local, Ordering::Relaxed);
-            n
-        }));
-    }
-    // writer drains ranges in order (range r blocks until produced; later ranges merge concurrently)
-    let mut guard = crate::cooler::PartialFileGuard::new(out);
-    let mut w = CoolWriter::create(out, &meta.names, &meta.lengths, meta.binsize, meta.nbins, &meta.chrom_offset, comp, &asm)?;
-    guard.arm();
-    let mut nnz = 0u64;
-    for r in 0..nranges {
-        while let Ok((b1, b2, c)) = rxs[r].recv() { w.append(&b1, &b2, &c)?; nnz += b1.len() as u64; }
-    }
-    // a worker error also closes its channel, so the drain loop above cannot tell a finished
-    // range from a failed one — join and check every worker BEFORE finalizing the output
-    for h in handles {
-        h.join().map_err(|_| anyhow::anyhow!("merge worker thread panicked"))??;
-    }
-    w.close()?;
-    guard.defuse();
-    warn_clamped(nclamped.load(Ordering::Relaxed));
-    if log { eprintln!("  merge(parallel) DONE: {} pixels in {:.0}s", nnz, t0.elapsed().as_secs_f64()); }
-    Ok(nnz)
-}
-
-pub fn merge_coolers(
-    paths: &[String], res: Option<&str>, out: &str, mem_gb: f64, comp: Comp, assembly: Option<&str>, log: bool,
-) -> Result<u64> {
-    let t0 = std::time::Instant::now();
-    let meta = read_meta(&paths[0], res)?;
-    check_inputs_match(&meta, paths, res)?;
-    let nbins = meta.nbins as i64;
-    crate::cooler::check_key_space(nbins)?;
-    // no mystery coolers: assembly from override, else inputs, else fingerprint, else refuse
-    let chromsizes: Vec<(String, i64)> = meta.names.iter().cloned().zip(meta.lengths.iter().cloned()).collect();
-    let asm = match assembly {
-        Some(a) if !a.trim().is_empty() => a.trim().to_string(),
-        _ if !meta.assembly.is_empty() && meta.assembly != "unknown" => meta.assembly.clone(),
-        _ => crate::view::detect("", &chromsizes).map(|s| s.to_string()).ok_or_else(|| anyhow::anyhow!(
-            "refusing to merge into a cooler without a genome assembly (inputs lack one); pass --assembly <name>"))?,
-    };
-    let k = paths.len().max(1);
-    let block = ((mem_gb * 1e9 / (16.0 * k as f64)) as usize).max(1 << 18); // 16 B/entry buffered
-    let srcs: Vec<CoolerPix> = paths.iter()
-        .map(|p| CoolerPix::open(p, res, meta.nbins, block))
-        .collect::<Result<_>>()?;
-    if log { eprintln!("  merge {} coolers, {} nbins, assembly={}, block={} pix (mem {:.1}G)", k, meta.nbins, asm, block, mem_gb); }
-    let mut guard = crate::cooler::PartialFileGuard::new(out);
-    let mut w = CoolWriter::create(out, &meta.names, &meta.lengths, meta.binsize, meta.nbins,
-        &meta.chrom_offset, comp, &asm)?;
-    guard.arm();
-    let emit_block = 1 << 22;
-    let mut nclamped = 0u64;
-    let nnz = merge_sources(srcs, emit_block, |keys, cnts| {
-        let b1: Vec<i64> = keys.iter().map(|&x| x / nbins).collect();
-        let b2: Vec<i64> = keys.iter().map(|&x| x % nbins).collect();
-        let c: Vec<i32> = cnts.iter().map(|&x| clamp_count(x, &mut nclamped)).collect();
-        w.append(&b1, &b2, &c)
+        paths.iter().zip(&offs).map(|(pth, o)| {
+            CoolerPix::open_slice(pth, grp, meta.nbins, block, o[lo] as usize, o[hi] as usize)
+        }).collect()
     })?;
     w.close()?;
     guard.defuse();
-    warn_clamped(nclamped);
-    if log { eprintln!("  merge DONE: {} pixels in {:.1}s", nnz, t0.elapsed().as_secs_f64()); }
+    if log { eprintln!("  merge DONE: {} pixels in {:.0}s", nnz, t0.elapsed().as_secs_f64()); }
     Ok(nnz)
 }

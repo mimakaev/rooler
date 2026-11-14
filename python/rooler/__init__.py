@@ -26,6 +26,8 @@ Keep the handle open and reuse it.
     Prefer a long-lived handle for a whole analysis; use `with` when you are about to write
     to the same file, or in a long-running process that opens many coolers.
 """
+import json
+
 import numpy as np
 import pandas as pd
 import h5py
@@ -38,7 +40,7 @@ try:
 except ImportError:  # pixels()/bins() fall back to pandas
     pl = None
 
-__version__ = "0.1.0a1"
+__version__ = "0.1.0a2"
 __all__ = ["open", "Rooler", "__version__"]
 
 
@@ -105,8 +107,16 @@ class Rooler:
     # ---- metadata (cooler-compatible) ----
     @property
     def info(self):
-        return {"nbins": self.nbins, "nnz": self.nnz, "bin-size": self.binsize,
-                "nchroms": len(self.chromnames), "balanced": self._weight is not None}
+        """The cooler's metadata attributes — the same dict `cooler.Cooler(...).info` gives
+        (`nnz`, `sum`, `nbins`, `bin-size`, `genome-assembly`, ...). It is whatever the file
+        stores: coolers written by rooler before 0.1.0a2 lack `sum`; `rooler repack` adds it."""
+        d = {k: (v.decode() if isinstance(v, bytes) else v) for k, v in self._g.attrs.items()}
+        if isinstance(d.get("metadata"), str):
+            try:
+                d["metadata"] = json.loads(d["metadata"])
+            except ValueError:
+                pass
+        return d
 
     @property
     def shape(self):
@@ -234,7 +244,9 @@ class Rooler:
     # ---- region -> bin range ----
     def _region_span(self, chrom, start, end):
         """Bin range of a *view region*, assigning each bin to the region holding most of it
-        (midpoint rule). Must match src/expected.rs, or ooe would divide by the wrong curve."""
+        (midpoint rule), so adjacent regions never share a bin. src/expected.rs computes each
+        region's curve over the slightly wider floor/ceil extent (as cooltools does), which
+        always contains this one — so every distance fetched here has an expected value."""
         ci = self._cid[chrom]
         base = int(self.chrom_offset[ci])
         cbins = int(self.chrom_offset[ci + 1]) - base
@@ -250,14 +262,15 @@ class Rooler:
 
     # ---- fetch (the operation) ----
     def raw(self, region1=None, region2=None, sparse=False):
-        """r.raw("chr1:1-2M") -> dense raw matrix. No region -> a slicer: r.raw()[a:b, c:d]."""
+        """r.raw("chr1:1,000,000-2,000,000") -> dense raw matrix.
+        No region -> a bin-index slicer: r.raw()[a:b, c:d]."""
         if region1 is None:
-            return _Slicer(self, balance=False)
+            return _MatrixSelector(self, balance=False)
         return self._fetch_region(region1, region2, balance=False, sparse=sparse)
 
     def balanced(self, region1=None, region2=None, sparse=False):
         if region1 is None:
-            return _Slicer(self, balance=True)
+            return _MatrixSelector(self, balance=True)
         return self._fetch_region(region1, region2, balance=True, sparse=sparse)
 
     balance = balanced  # alias
@@ -394,22 +407,18 @@ class Rooler:
     def _fetch_bins(self, a0, a1, b0, b1, balance, sparse):
         na, nb = a1 - a0, b1 - b0
         M = np.zeros((na, nb), dtype=np.float64)
-        # direct: stored pixels with bin1 in a-range, col j in b-range
+        # A stored pixel (p, q), p <= q, fills M[p, q] and its mirror M[q, p]. Pixels are unique,
+        # so plain assignment is enough (the diagonal is simply written twice with one value).
+        # direct: stored pixels with bin1 in the a-range and bin2 in the b-range
         i, j, c = self._read_rows(a0, a1)
         m = (j >= b0) & (j < b1)
-        np.add.at(M, (i[m] - a0, j[m] - b0), c[m])
-        # transpose (symmetric-upper): stored pixels with bin1 in b-range, col in a-range.
-        # A cis square fetch (the common case) has identical ranges — reuse the rows already
-        # read instead of hitting HDF5 a second time.
-        if (b0, b1) == (a0, a1):
-            i2, j2, c2 = i, j, c
-        else:
-            i2, j2, c2 = self._read_rows(b0, b1)
-        m2 = (j2 >= a0) & (j2 < a1)
-        np.add.at(M, (j2[m2] - a0, i2[m2] - b0), c2[m2])
-        # the diagonal (p==q, p in a & b range) is the only cell hit by both passes -> subtract once
-        diag = m & (i == j) & (i >= b0) & (i < b1)
-        np.add.at(M, (i[diag] - a0, j[diag] - b0), -c[diag])
+        M[i[m] - a0, j[m] - b0] = c[m]
+        # mirror: stored pixels with bin1 in the b-range and bin2 in the a-range. A cis square
+        # fetch (the common case) has identical ranges — reuse the rows already read.
+        if (b0, b1) != (a0, a1):
+            i, j, c = self._read_rows(b0, b1)
+        m = (j >= a0) & (j < a1)
+        M[j[m] - a0, i[m] - b0] = c[m]
         if balance:
             w = self.weights()
             if w is None:
@@ -422,21 +431,9 @@ class Rooler:
         return M
 
 
-class _Slicer:
-    """r.raw()[a:b, c:d] — bin-index access."""
-    def __init__(self, roo, balance):
-        self.roo, self.balance = roo, balance
-
-    def __getitem__(self, key):
-        s1, s2 = key if isinstance(key, tuple) else (key, key)
-        n = self.roo.nbins
-        a0, a1 = (s1.start or 0), (s1.stop if s1.stop is not None else n)
-        b0, b1 = (s2.start or 0), (s2.stop if s2.stop is not None else n)
-        return self.roo._fetch_bins(a0, a1, b0, b1, self.balance, False)
-
-
 class _MatrixSelector:
-    """cooler-compatible: clr.matrix(balance=True).fetch("chr1") and clr.matrix()[i0:i1, j0:j1]."""
+    """cooler-compatible: clr.matrix(balance=True).fetch("chr1") and clr.matrix()[i0:i1, j0:j1].
+    Also what r.raw() / r.balanced() return when called without a region."""
     def __init__(self, roo, balance, sparse=False):
         self.roo, self.balance, self.sparse = roo, balance, sparse
 

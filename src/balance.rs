@@ -34,9 +34,9 @@ fn median(v: &mut [f64]) -> f64 {
 
 pub fn balance(uri: &str, p: Params, log: bool) -> Result<()> {
     let t0 = std::time::Instant::now();
-    let (path, grp) = match uri.split_once("::") { Some((a, b)) => (a.to_string(), b.to_string()), None => (uri.to_string(), "/".to_string()) };
+    let (path, grp) = crate::cooler::split_uri(uri);
     let f = File::append(&path)?;
-    let g = if grp == "/" { f.group("/")? } else { f.group(&grp)? };
+    let g = f.group(&grp)?;
     crate::cooler::check_supported(&g)?;
     // probe sizes (dataset shapes only) to route the kernel and place the scratch
     let nbins_probe = g.dataset("bins/start")?.shape()[0];
@@ -121,7 +121,9 @@ pub fn balance(uri: &str, p: Params, log: bool) -> Result<()> {
     dw.write(&ndarray::arr1(&weight))?;
     let ai = |n: &str, v: i64| -> Result<()> { dw.new_attr::<i64>().create(n)?.write_scalar(&v)?; Ok(()) };
     let af = |n: &str, v: f64| -> Result<()> { dw.new_attr::<f64>().create(n)?.write_scalar(&v)?; Ok(()) };
-    let ab = |n: &str, v: bool| -> Result<()> { dw.new_attr::<hdf5::types::VarLenAscii>().create(n)?.write_scalar(&hdf5::types::VarLenAscii::from_ascii(if v {"True"} else {"False"})?)?; Ok(()) };
+    // real booleans (the HDF5 enum h5py reads back as numpy.bool_), exactly as cooler writes
+    // them: as a string, "False" would be truthy to every Python consumer
+    let ab = |n: &str, v: bool| -> Result<()> { dw.new_attr::<bool>().create(n)?.write_scalar(&v)?; Ok(()) };
     ab("converged", converged)?; ab("cis_only", false)?; ab("divisive_weights", false)?;
     ai("ignore_diags", p.ignore_diags)?; af("mad_max", p.mad_max)?; af("min_nnz", p.min_nnz)?;
     ai("min_count", p.min_count as i64)?; af("tol", p.tol)?; af("scale", mean)?; af("var", cv * cv)?;

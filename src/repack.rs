@@ -3,8 +3,9 @@
 //! against the chromosome sizes, balanced if it carries no weights, expected computed. The one-shot
 //! "make this old cooler nice" op. In place by default (atomic tmp+rename); `--backup` keeps the
 //! original at `<src>.bac`; `--out` writes elsewhere and leaves the source untouched.
-use crate::cooler::{read_meta, Comp, CoolWriter, PartialFileGuard};
-use anyhow::{anyhow, bail, Result};
+use crate::cooler::{read_meta, read_str_attr, write_str_attr, Comp, CoolWriter, PartialFileGuard};
+use anyhow::{bail, Result};
+use hdf5::types::TypeDescriptor as T;
 use hdf5::File;
 
 pub struct RepackOpts {
@@ -20,31 +21,24 @@ pub struct RepackOpts {
 pub fn repack(src: &str, o: RepackOpts, log: bool) -> Result<()> {
     let t0 = std::time::Instant::now();
     // enumerate resolution groups (mcool) or the single root cooler
-    let resolutions: Vec<Option<String>> = {
+    let (is_mcool, groups): (bool, Vec<String>) = {
         let f = File::open(src)?;
         if f.link_exists("resolutions") {
             let mut names = f.group("resolutions")?.member_names()?;
             names.sort_by_key(|s| s.parse::<i64>().unwrap_or(i64::MAX));
             if names.is_empty() { bail!("{}: empty resolutions group", src); }
-            names.into_iter().map(Some).collect()
+            (true, names.into_iter().map(|r| format!("resolutions/{}", r)).collect())
         } else {
-            vec![None]
+            (false, vec!["/".to_string()])
         }
     };
-    let is_mcool = resolutions[0].is_some();
 
     // resolve the assembly (override > stored > fingerprint > refuse), then VERIFY it: if the
     // name maps to a genome we know AND the chromsizes fingerprint to a genome we know, they
     // must agree — `repack --assembly hg19` on an hg38 file is exactly the mistake to catch.
-    let meta0 = read_meta(src, resolutions[0].as_deref())?;
-    let chromsizes: Vec<(String, i64)> = meta0.names.iter().cloned().zip(meta0.lengths.iter().cloned()).collect();
-    let asm = match &o.assembly {
-        Some(a) if !a.trim().is_empty() => a.trim().to_string(),
-        _ if !meta0.assembly.is_empty() && meta0.assembly != "unknown" => meta0.assembly.clone(),
-        _ => crate::view::detect("", &chromsizes).map(|s| s.to_string()).ok_or_else(|| anyhow!(
-            "refusing to repack without a genome assembly: the file has none and the chromsizes \
-             are not recognized; pass --assembly <name>"))?,
-    };
+    let meta0 = read_meta(src, &groups[0])?;
+    let chromsizes = meta0.chromsizes();
+    let asm = crate::view::resolve_assembly(o.assembly.as_deref(), &meta0.assembly, &chromsizes)?;
     let by_name = crate::view::detect(&asm, &[]);
     let by_fp = crate::view::detect("", &chromsizes);
     if let (Some(a), Some(b)) = (by_name, by_fp) {
@@ -53,8 +47,8 @@ pub fn repack(src: &str, o: RepackOpts, log: bool) -> Result<()> {
                    not stamping a wrong provenance", asm, b);
         }
     }
-    if log { eprintln!("  repack: {} ({} resolution{}), assembly={}{}", src, resolutions.len(),
-        if resolutions.len() == 1 { "" } else { "s" }, asm,
+    if log { eprintln!("  repack: {} ({} resolution{}), assembly={}{}", src, groups.len(),
+        if groups.len() == 1 { "" } else { "s" }, asm,
         if by_name.is_some() && by_fp.is_some() { " (verified against chromsizes)" } else { "" }); }
 
     let final_path = o.out.clone().unwrap_or_else(|| src.to_string());
@@ -62,31 +56,24 @@ pub fn repack(src: &str, o: RepackOpts, log: bool) -> Result<()> {
     let mut guard = PartialFileGuard::new(&tmp);
 
     // ---- write phase: pixels + weights, one output handle, dropped before balance/expected ----
-    let mut had_weight = vec![false; resolutions.len()];
+    let mut had_weight = vec![false; groups.len()];
     {
         let sf = File::open(src)?;
-        let f = File::create(&tmp)?;
+        let f = if is_mcool { crate::cooler::create_mcool(&tmp)? } else { File::create(&tmp)? };
         guard.arm();
-        if is_mcool {
-            f.new_attr::<hdf5::types::VarLenAscii>().create("format")?
-                .write_scalar(&hdf5::types::VarLenAscii::from_ascii("HDF5::MCOOL")?)?;
-            f.new_attr::<i64>().create("format-version")?.write_scalar(&2i64)?;
-            f.create_group("resolutions")?;
-        }
-        for (ri, res) in resolutions.iter().enumerate() {
-            let meta = read_meta(src, res.as_deref())?;
-            let group = match res { Some(r) => format!("resolutions/{}", r), None => "/".to_string() };
-            let sg = if group == "/" { sf.group("/")? } else { sf.group(&group)? };
-            let mut w = CoolWriter::create_in(&f, &group, &meta.names, &meta.lengths, meta.binsize,
-                meta.nbins, &meta.chrom_offset, o.comp, &asm)?;
+        for (ri, group) in groups.iter().enumerate() {
+            let meta = read_meta(src, group)?;
+            let sg = sf.group(group)?;
+            let mut w = CoolWriter::create_in(&f, group, &meta.names, &meta.lengths, meta.binsize,
+                o.comp, &asm)?;
             crate::parread::stream_pixels(&sg, 1 << 22, |a, b, c| w.append(a, b, c))?;
             let n = w.nnz;
             w.close()?;
-            let dg = if group == "/" { f.group("/")? } else { f.group(&group)? };
-            had_weight[ri] = copy_weight(&sg, &dg)?;
-            copy_extra_bin_columns(&sg, &dg)?;
-            if log { eprintln!("  repack: {} rewritten ({} pix{}) {:.0}s",
-                res.as_deref().map(|r| format!("{}bp", r)).unwrap_or_else(|| "cooler".into()),
+            let dg = f.group(group)?;
+            // user metadata (a JSON string) survives the rewrite
+            if let Some(m) = read_str_attr(&sg, "metadata") { write_str_attr(&dg, "metadata", &m)?; }
+            had_weight[ri] = copy_bin_columns(&sg, &dg)?;
+            if log { eprintln!("  repack: {} rewritten ({} pix{}) {:.0}s", group,
                 n, if had_weight[ri] { ", weights carried" } else { "" }, t0.elapsed().as_secs_f64()); }
         }
     }
@@ -105,8 +92,8 @@ pub fn repack(src: &str, o: RepackOpts, log: bool) -> Result<()> {
     guard.defuse();
 
     // ---- balance (only if the source had no weights) + expected, per resolution ----
-    for (ri, res) in resolutions.iter().enumerate() {
-        let uri = match res { Some(r) => format!("{}::resolutions/{}", final_path, r), None => final_path.clone() };
+    for (ri, group) in groups.iter().enumerate() {
+        let uri = format!("{}::{}", final_path, group);
         if !had_weight[ri] {
             if log { eprintln!("  repack: {} has no weights -> balancing", uri); }
             crate::balance::balance(&uri, crate::balance::Params {
@@ -118,53 +105,55 @@ pub fn repack(src: &str, o: RepackOpts, log: bool) -> Result<()> {
     Ok(())
 }
 
-/// Copy any bins/* column the writer does not create itself (GC content, mappability, extra or
-/// alternatively-named weights). repack rewrites in place by default, so dropping them would be
-/// silent data loss on exactly the files repack exists for — ones made by other tools.
-fn copy_extra_bin_columns(sg: &hdf5::Group, dg: &hdf5::Group) -> Result<()> {
-    let sb = sg.group("bins")?;
-    let db = dg.group("bins")?;
+/// Copy every bins/* column the writer does not create itself — `weight`, and anything a
+/// different tool added (GC content, mappability, alternative weights) — with its attributes.
+/// repack rewrites in place by default, so dropping or degrading them would be silent data loss
+/// on exactly the files repack exists for. Returns whether the source had `bins/weight`.
+fn copy_bin_columns(sg: &hdf5::Group, dg: &hdf5::Group) -> Result<bool> {
+    let (sb, db) = (sg.group("bins")?, dg.group("bins")?);
     for name in sb.member_names()? {
-        if matches!(name.as_str(), "chrom" | "start" | "end" | "weight") { continue; }
-        let sd = match sb.dataset(&name) { Ok(d) => d, Err(_) => continue };
-        let n = sd.shape()[0];
+        if matches!(name.as_str(), "chrom" | "start" | "end") { continue; }
+        let Ok(sd) = sb.dataset(&name) else { continue };
+        let n = sd.size();
         let mk = |b: hdf5::DatasetBuilderEmpty| b.shape([n]).shuffle().deflate(4);
-        if let Ok(v) = sd.read_1d::<f64>() {
-            mk(db.new_dataset::<f64>()).create(name.as_str())?.write(&v)?;
-        } else if let Ok(v) = sd.read_1d::<i64>() {
-            mk(db.new_dataset::<i64>()).create(name.as_str())?.write(&v)?;
-        } else {
-            eprintln!("  repack: WARNING bins/{} has a type this build cannot copy; \
-                       it is NOT carried into the output", name);
+        // dispatch on the STORED type: HDF5 would happily convert float<->int on read, so
+        // "try a type and see if it reads" silently truncates
+        let dd = match sd.dtype()?.to_descriptor() {
+            Ok(T::Float(_)) => { let d = mk(db.new_dataset::<f64>()).create(name.as_str())?; d.write(&sd.read_1d::<f64>()?)?; d }
+            Ok(T::Integer(_) | T::Unsigned(_)) => { let d = mk(db.new_dataset::<i64>()).create(name.as_str())?; d.write(&sd.read_1d::<i64>()?)?; d }
+            Ok(T::Boolean) => { let d = mk(db.new_dataset::<bool>()).create(name.as_str())?; d.write(&sd.read_1d::<bool>()?)?; d }
+            _ => {
+                eprintln!("  repack: WARNING bins/{} has a type this build cannot copy; \
+                           it is NOT carried into the output", name);
+                continue;
+            }
+        };
+        copy_scalar_attrs(&sd, &dd, &format!("bins/{}", name))?;
+    }
+    Ok(db.link_exists("weight"))
+}
+
+/// Copy scalar attributes, keeping each one's kind (int / float / bool / string) — these are the
+/// balancing parameters on bins/weight. Files written by rooler before 0.1.0-alpha.2 stored the
+/// boolean flags as the strings "True"/"False"; those are upgraded to real booleans here.
+fn copy_scalar_attrs(src: &hdf5::Location, dst: &hdf5::Location, what: &str) -> Result<()> {
+    for name in src.attr_names()? {
+        let a = src.attr(&name)?;
+        let n = name.as_str();
+        match a.dtype()?.to_descriptor() {
+            Ok(T::Integer(_) | T::Unsigned(_)) if a.is_scalar() =>
+                dst.new_attr::<i64>().create(n)?.write_scalar(&a.read_scalar::<i64>()?)?,
+            Ok(T::Float(_)) if a.is_scalar() =>
+                dst.new_attr::<f64>().create(n)?.write_scalar(&a.read_scalar::<f64>()?)?,
+            Ok(T::Boolean) if a.is_scalar() =>
+                dst.new_attr::<bool>().create(n)?.write_scalar(&a.read_scalar::<bool>()?)?,
+            _ => match read_str_attr(src, n).as_deref() {
+                Some("True") => dst.new_attr::<bool>().create(n)?.write_scalar(&true)?,
+                Some("False") => dst.new_attr::<bool>().create(n)?.write_scalar(&false)?,
+                Some(s) => write_str_attr(dst, n, s)?,
+                None => eprintln!("  repack: WARNING {} attribute {:?} has an unsupported type; not carried", what, name),
+            },
         }
     }
     Ok(())
-}
-
-/// Copy bins/weight (values + scalar attrs) from the source group into the freshly written one.
-/// Attr types vary by writer (rooler: ascii "True"; cooler: numpy bools/ints/floats) — try the
-/// common scalar types in turn and skip anything unreadable rather than fail the repack.
-fn copy_weight(sg: &hdf5::Group, dg: &hdf5::Group) -> Result<bool> {
-    if !sg.link_exists("bins/weight") { return Ok(false); }
-    let sd = sg.dataset("bins/weight")?;
-    let v = sd.read_1d::<f64>()?;
-    let dd = dg.group("bins")?.new_dataset::<f64>().shape([v.len()]).shuffle().deflate(4)
-        .create("weight")?;
-    dd.write(&v)?;
-    for name in sd.attr_names()? {
-        let a = sd.attr(&name)?;
-        if let Ok(x) = a.read_scalar::<i64>() {
-            dd.new_attr::<i64>().create(name.as_str())?.write_scalar(&x)?;
-        } else if let Ok(x) = a.read_scalar::<f64>() {
-            dd.new_attr::<f64>().create(name.as_str())?.write_scalar(&x)?;
-        } else if let Ok(x) = a.read_scalar::<hdf5::types::VarLenAscii>() {
-            dd.new_attr::<hdf5::types::VarLenAscii>().create(name.as_str())?.write_scalar(&x)?;
-        } else if let Ok(x) = a.read_scalar::<bool>() {
-            dd.new_attr::<hdf5::types::VarLenAscii>().create(name.as_str())?
-                .write_scalar(&hdf5::types::VarLenAscii::from_ascii(if x { "True" } else { "False" })?)?;
-        } else {
-            eprintln!("  repack: weight attr {:?} has an unsupported type; not carried", name);
-        }
-    }
-    Ok(true)
 }

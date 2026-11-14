@@ -1,6 +1,6 @@
 [package]
 name = "rooler"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 edition = "2021"
 rust-version = "1.75"
 description = "Fast, out-of-core engine for Hi-C/micro-C cooler files: cload, merge, zoomify, balance, expected"
