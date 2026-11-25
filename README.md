@@ -169,6 +169,29 @@ whole chromosomes where they are not (mouse, fly, worm).
 **Counts are `int32`.** Internal accumulators are 64-bit, but stored counts saturate at
 2,147,483,647 — a value unlikely to represent a true pixel of a Hi-C map.
 
+### Pairs (experimental)
+
+`rooler pairs` replaces the `pairtools parse | sort | merge | dedup | stats` chain with a
+binary pairs file: Parquet, sorted chrom1-pos1-chrom2-pos2 in chromsizes order, about 6.6 bytes
+per pair with mapq columns. Any Parquet reader opens it.
+
+```
+rooler pairs parse <sam|-> <out.parquet>   [--chroms-path sizes] [--assembly mm10] [--min-mapq 1]
+                                           [--max-inter-align-gap 20] [--max-molecule-size 750]
+rooler pairs sort  <pairs[.gz]|-> <out.parquet>          [--mem 4] [--threads 8]
+rooler pairs merge <out.parquet> <in.parquet> ...        [--dedup N] [--stats file]
+rooler pairs view  <file.parquet>          [--min-mapq 30] [--chroms sizes] [--no-header]
+rooler pairs scan  <file.parquet>
+```
+
+- **parse** — name-grouped SAM straight from the mapper to a sorted pairs file. It follows
+  `pairtools parse --walks-policy all --add-columns mapq` (pairtools 1.1.2) pair for pair,
+  including its quirks; only pairs unique on both sides are stored, the other types are counted.
+- **merge** — merges sorted files; `--dedup N` drops pairs within N bp on both sides of an
+  earlier kept pair (same chromosomes and strands) and writes pairtools-style stats, without
+  `dist_freq`. The dedup rule is not pairtools' exactly; duplicate counts agree to about 0.1%.
+- **view** — 4DN text on stdout, e.g. `rooler pairs view x.parquet --min-mapq 30 | rooler cload - 1000 x.cool`.
+
 ## Compatibility
 
 rooler writes ordinary cooler files: gzip-compressed with the same shuffle+deflate pipeline

@@ -28,6 +28,9 @@ num-complex = "0.4"
 libdeflater = "1.25.2"
 hdf5-metno-sys = "0.10.1"
 memmap2 = "0.9"
+parquet = { version = "56", default-features = false, features = ["arrow", "zstd", "lz4"] }
+arrow-array = "56"
+arrow-schema = "56"
 
 [profile.release]
 opt-level = 3
