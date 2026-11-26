@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Added — `rooler pairs` (experimental)
+A binary pairs format (sorted Parquet) and the tools around it: `pairs parse` (SAM → pairs, a
+port of `pairtools parse --walks-policy all`), `pairs sort` (text pairs → Parquet), `pairs merge`
+(merge, optional `--dedup`, pairtools-style stats), `pairs view` (→ 4DN text, mapq and
+chromosome filters) and `pairs scan`. Checked on 3.87 billion mouse Hi-C read pairs against a
+distiller/pairtools run: parsed pairs identical on a 2M-read sample, group totals of mapped,
+duplicate and cis pairs within about 0.1%.
+
 ### Fixed — cooler attribute compatibility
 A rooler cooler was missing attributes every cooler-written file has, so code indexing
 `Cooler.info` could fail on rooler output (`cooltools.sample` reads `info["sum"]`, for one).
